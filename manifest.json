@@ -1,11 +1,11 @@
 {
   "name": "gardenbeds-plant-explorer",
-  "label": "Widget Template Map Aware",
+  "label": "Plant Explorer",
   "type": "widget",
   "version": "1.14.0",
   "exbVersion": "1.14.0",
-  "author": "Cam Cooper",
-  "description": "",
+  "author": "Garden Beds Team",
+  "description": "Interactive hierarchical tree view of garden zones, beds, and plant species with inventory details.",
   "copyright": "",
   "license": "http://www.apache.org/licenses/LICENSE-2.0",
   "properties": {},
@@ -16,7 +16,7 @@
     "en"
   ],
   "defaultSize": {
-    "width": 420,
-    "height": 500
+    "width": 320,
+    "height": 700
   }
 }
