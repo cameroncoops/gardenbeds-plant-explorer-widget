@@ -11,15 +11,13 @@ import {
 } from 'jimu-arcgis'
 import FeatureEffect from 'esri/layers/support/FeatureEffect'
 import FeatureFilter from 'esri/layers/support/FeatureFilter'
-import Query from 'esri/rest/support/Query'
-import { executeQueryJSON } from 'esri/rest/query'
+import { buildSqlInClause, firstValue, getGardenUidFromRecord, getRecordAttributes, escapeSqlValue } from './lib/field-helpers'
+import { queryPlantLinesForBed, queryPlantsInBedTotal } from './lib/plant-queries'
+import type { PlantLine } from './lib/plant-types'
+import { SELECTED_SPECIES_UID_KEY } from './lib/service-urls'
 
 const { useEffect, useState } = React
 
-// Shared service endpoints used to lazily load stock information for each bed.
-const PLANTS_IN_BED_LAYER_URL = 'https://arcgis.curtin.edu.au/arcgis/rest/services/Parks_Gardens/PropGIS_SDE_GardenBedsTEST_PlantsInBeds_/MapServer/0'
-const SPECIES_LAYER_URL = 'https://arcgis.curtin.edu.au/arcgis/rest/services/Parks_Gardens/PropGIS_SDE_GardenBedsTEST_Plant_Species_/FeatureServer/0'
-const SELECTED_SPECIES_UID_KEY = 'gardenbeds:selectedSpeciesUid'
 const MASTER_WHERE = "status = 'Active' OR status IS NULL"
 const ACCENT_COLOR = '#007ac2'
 const MUTED_TEXT_COLOR = '#666'
@@ -118,7 +116,7 @@ const HELP_POPOVER_STYLE = {
   fontSize: '0.82rem',
   lineHeight: 1.45
 }
-const WIDGET_VERSION = 'v2026.04.10-1'
+const WIDGET_VERSION = 'v2026.04.10-2'
 
 const getTreeToggleIcon = (isExpanded: boolean): string =>
 {
@@ -130,16 +128,6 @@ interface BedItem {
   gardenUid: string
   bedNo: string
   area: string
-}
-
-// A lazily loaded stock line rendered under "Total Plants".
-interface PlantLine {
-  speciesUid: string
-  speciesName: string
-  quantity: number
-  costPerUnit: number
-  unitType: string
-  usedSpeciesUidFallback: boolean
 }
 
 interface SpeciesGroup {
@@ -160,28 +148,6 @@ interface HighlightHandle {
 
 interface ViewEventHandle {
   remove: () => void
-}
-
-// Returns the first populated attribute value from a list of possible field names.
-const firstValue = (attributes: any, fieldNames: string[]): string =>
-{
-  for (const fieldName of fieldNames)
-  {
-    const value = attributes?.[fieldName]
-
-    if (value !== null && value !== undefined && String(value).trim() !== '')
-    {
-      return String(value).trim()
-    }
-  }
-
-  return ''
-}
-
-// Escapes single quotes for REST where clauses.
-const escapeSqlValue = (value: string): string =>
-{
-  return value.replace(/'/g, "''")
 }
 
 // Formats counts/costs without trailing decimal zeroes.
@@ -218,21 +184,6 @@ const normalizeFilterValue = (value: string): string =>
   return value.trim().toLowerCase()
 }
 
-const getRecordAttributes = (record: any): any =>
-{
-  return record?.getData ? record.getData() : (record?.attributes || {})
-}
-
-const getGardenUidFromRecord = (record: any): string =>
-{
-  return firstValue(getRecordAttributes(record), ['garden_uid', 'GARDEN_UID'])
-}
-
-const buildSqlInClause = (fieldName: string, values: string[]): string =>
-{
-  return `${fieldName} IN (${values.map((value) => `'${escapeSqlValue(value)}'`).join(', ')})`
-}
-
 const isMasterLayerMatch = (layerLike: any, dataSourceId?: string): boolean =>
 {
   const layerId = String(layerLike?.id || '')
@@ -266,125 +217,6 @@ const isMasterLayerMatch = (layerLike: any, dataSourceId?: string): boolean =>
     String(layerUrl).toLowerCase().includes('gardenbedstest_master') ||
     String(layerUrl).toLowerCase().includes('gardenbeds_master')
   )
-}
-
-// Loads and sums all current_quantity values for a single bed.
-// This is done lazily when a bed is expanded to keep the initial widget load fast.
-const queryPlantsInBedTotal = async (gardenUid: string): Promise<number> =>
-{
-  try
-  {
-    const query = new Query({
-      where: `garden_uid = '${escapeSqlValue(gardenUid)}'`,
-      outFields: ['current_quantity'],
-      returnGeometry: false
-    })
-
-    const data = await executeQueryJSON(PLANTS_IN_BED_LAYER_URL, query as any)
-    const features = Array.isArray(data?.features) ? data.features : []
-
-    return features.reduce((sum: number, feature: any) =>
-    {
-      const quantity = Number(feature?.attributes?.current_quantity ?? feature?.attributes?.CURRENT_QUANTITY)
-      return sum + (Number.isFinite(quantity) ? quantity : 0)
-    }, 0)
-  }
-  catch (error)
-  {
-    console.warn(`Failed to load plant total for garden_uid ${gardenUid}`, error)
-    return 0
-  }
-}
-
-// Loads the detailed stock rows for a single bed and enriches them with species names.
-// This is done only when the "Total Plants" line is expanded.
-const queryPlantLinesForBed = async (gardenUid: string): Promise<PlantLine[]> =>
-{
-  try
-  {
-    const plantsQuery = new Query({
-      where: `garden_uid = '${escapeSqlValue(gardenUid)}'`,
-      outFields: ['species_uid', 'current_quantity', 'cost_per_unit', 'unit_type'],
-      returnGeometry: false
-    })
-
-    const plantsResult = await executeQueryJSON(PLANTS_IN_BED_LAYER_URL, plantsQuery as any)
-    const features = Array.isArray(plantsResult?.features) ? plantsResult.features : []
-    const speciesUids = Array.from(new Set(features
-      .map((feature: any) => firstValue(feature?.attributes, ['species_uid', 'SPECIES_UID']))
-      .filter((value: string) => value !== '')))
-    const speciesNameByUid = new Map<string, string>()
-
-    if (speciesUids.length > 0)
-    {
-      try
-      {
-        const speciesQuery = new Query({
-          where: buildSqlInClause('species_uid', speciesUids),
-          outFields: ['species_uid', 'species_name', 'common_name'],
-          returnGeometry: false
-        })
-
-        const speciesResult = await executeQueryJSON(SPECIES_LAYER_URL, speciesQuery as any)
-
-        ;(speciesResult?.features || []).forEach((feature: any) =>
-        {
-          const attributes = feature?.attributes || {}
-          const speciesUid = firstValue(attributes, ['species_uid', 'SPECIES_UID'])
-          const speciesName = firstValue(attributes, ['species_name', 'SPECIES_NAME', 'common_name', 'COMMON_NAME'])
-
-          if (speciesUid !== '')
-          {
-            speciesNameByUid.set(speciesUid, speciesName || speciesUid)
-          }
-        })
-      }
-      catch (error)
-      {
-        console.warn(`Failed to load species lookup for garden_uid ${gardenUid}`, error)
-      }
-    }
-
-    return features
-      .map((feature: any) =>
-      {
-        const attributes = feature?.attributes || {}
-        const speciesUid = firstValue(attributes, ['species_uid', 'SPECIES_UID'])
-        const quantity = Number(attributes?.current_quantity ?? attributes?.CURRENT_QUANTITY)
-        const costPerUnit = Number(attributes?.cost_per_unit ?? attributes?.COST_PER_UNIT)
-        const speciesName = speciesNameByUid.get(speciesUid) || speciesUid
-
-        return {
-          speciesUid,
-          speciesName,
-          quantity: Number.isFinite(quantity) ? quantity : 0,
-          costPerUnit: Number.isFinite(costPerUnit) ? costPerUnit : 0,
-          unitType: firstValue(attributes, ['unit_type', 'UNIT_TYPE']) || '',
-          usedSpeciesUidFallback: speciesName === speciesUid
-        }
-      })
-      .sort((left, right) =>
-      {
-        const speciesCompare = left.speciesName.localeCompare(right.speciesName, undefined, { numeric: true, sensitivity: 'base' })
-
-        if (speciesCompare !== 0)
-        {
-          return speciesCompare
-        }
-
-        if (right.quantity !== left.quantity)
-        {
-          return right.quantity - left.quantity
-        }
-
-        return left.unitType.localeCompare(right.unitType, undefined, { numeric: true, sensitivity: 'base' })
-      })
-  }
-  catch (error)
-  {
-    console.warn(`Failed to load plant lines for garden_uid ${gardenUid}`, error)
-    return []
-  }
 }
 
 const groupPlantLinesBySpecies = (plantLines: PlantLine[]): SpeciesGroup[] =>
