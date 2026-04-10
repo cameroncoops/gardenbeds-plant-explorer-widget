@@ -22,11 +22,11 @@ const Setting = (props: AllWidgetSettingProps<any>) =>
 
   return (
     <div className="p-3">
-      <h4>Widget Template Settings</h4>
-      <p>Select a feature layer data source and a target map widget.</p>
+      <h4>Plant Explorer Settings</h4>
+      <p>Select the GardenBeds_Master data source and the target map widget.</p>
 
       <div className="mb-4">
-        <div className="mb-2"><strong>Feature layer data source</strong></div>
+        <div className="mb-2"><strong>GardenBeds_Master data source</strong></div>
         <DataSourceSelector
           mustUseDataSource
           types={Immutable([DataSourceTypes.FeatureLayer])}
