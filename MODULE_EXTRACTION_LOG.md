@@ -73,6 +73,7 @@ Purpose:
 
 Currently contains:
 - `PlantLine`
+- `SpeciesOption`
 
 Why it matters:
 - keeps query logic and widget rendering aligned
@@ -91,11 +92,15 @@ Purpose:
 Currently contains:
 - `queryPlantsInBedTotal(gardenUid)`
 - `queryPlantLinesForBed(gardenUid)`
+- `querySpeciesOptions()`
+- `queryGardenUidsForSpecies(speciesUid)`
 
 What it does:
 - queries `PlantsInBeds`
 - resolves species names via the Species `FeatureServer`
 - returns sorted plant rows ready for grouping/rendering
+- loads reusable species dropdown options for widgets
+- resolves matching `garden_uid` values for an internal species filter flow
 
 Why it matters:
 - this is the most valuable shared logic discovered so far
@@ -109,6 +114,10 @@ Likely future use:
 - plant explorer
 - species filter follow-up logic
 - stock and planting summary widgets
+
+Recent update:
+- Plant Explorer now has an integrated species filter using the same local query module
+- this replaces the need for a separate standalone species-filter widget in simple deployments
 
 ## What Is Still Widget-Local
 

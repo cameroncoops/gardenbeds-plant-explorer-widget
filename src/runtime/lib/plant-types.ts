@@ -6,3 +6,8 @@ export interface PlantLine {
   unitType: string
   usedSpeciesUidFallback: boolean
 }
+
+export interface SpeciesOption {
+  speciesUid: string
+  speciesName: string
+}

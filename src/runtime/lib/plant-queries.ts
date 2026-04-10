@@ -1,8 +1,84 @@
 import Query from 'esri/rest/support/Query'
 import { executeQueryJSON } from 'esri/rest/query'
 import { buildSqlInClause, escapeSqlValue, firstValue } from './field-helpers'
-import { PlantLine } from './plant-types'
+import { PlantLine, SpeciesOption } from './plant-types'
 import { PLANTS_IN_BED_LAYER_URL, SPECIES_LAYER_URL } from './service-urls'
+
+export const querySpeciesOptions = async (): Promise<SpeciesOption[]> =>
+{
+  try
+  {
+    const speciesQuery = new Query({
+      where: 'OBJECTID > 0',
+      outFields: ['species_uid', 'species_name'],
+      returnGeometry: false
+    })
+
+    const speciesResult = await executeQueryJSON(SPECIES_LAYER_URL, speciesQuery as any)
+    const speciesMap = new Map<string, SpeciesOption>()
+
+    ;(speciesResult?.features || []).forEach((feature: any) =>
+    {
+      const attributes = feature?.attributes || {}
+      const speciesUid = firstValue(attributes, ['species_uid', 'SPECIES_UID'])
+      const speciesName = firstValue(attributes, ['species_name', 'SPECIES_NAME'])
+
+      if (speciesUid !== '' && speciesName !== '' && !speciesMap.has(speciesUid))
+      {
+        speciesMap.set(speciesUid, {
+          speciesUid,
+          speciesName
+        })
+      }
+    })
+
+    return Array.from(speciesMap.values())
+      .sort((left, right) => left.speciesName.localeCompare(right.speciesName, undefined, { numeric: true, sensitivity: 'base' }))
+  }
+  catch (error)
+  {
+    console.warn('Failed to load species options', error)
+    return []
+  }
+}
+
+export const queryGardenUidsForSpecies = async (speciesUid: string): Promise<string[]> =>
+{
+  if (speciesUid.trim() === '')
+  {
+    return []
+  }
+
+  try
+  {
+    const plantsQuery = new Query({
+      where: `species_uid = '${escapeSqlValue(speciesUid)}'`,
+      outFields: ['garden_uid'],
+      returnGeometry: false
+    })
+
+    const plantsResult = await executeQueryJSON(PLANTS_IN_BED_LAYER_URL, plantsQuery as any)
+    const gardenUidSet = new Set<string>()
+
+    ;(plantsResult?.features || []).forEach((feature: any) =>
+    {
+      const gardenUid = firstValue(feature?.attributes, ['garden_uid', 'GARDEN_UID'])
+
+      if (gardenUid !== '')
+      {
+        gardenUidSet.add(gardenUid)
+      }
+    })
+
+    return Array.from(gardenUidSet)
+      .sort((left, right) => left.localeCompare(right, undefined, { numeric: true, sensitivity: 'base' }))
+  }
+  catch (error)
+  {
+    console.warn(`Failed to load garden_uids for species_uid ${speciesUid}`, error)
+    return []
+  }
+}
 
 // Loads and sums all current_quantity values for a single bed.
 // This is done lazily when a bed is expanded to keep the initial widget load fast.
