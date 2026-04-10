@@ -9,6 +9,8 @@ import {
   JimuMapViewComponent,
   type JimuMapView
 } from 'jimu-arcgis'
+import FeatureEffect from 'esri/layers/support/FeatureEffect'
+import FeatureFilter from 'esri/layers/support/FeatureFilter'
 import Query from 'esri/rest/support/Query'
 import { executeQueryJSON } from 'esri/rest/query'
 
@@ -16,7 +18,7 @@ const { useEffect, useState } = React
 
 // Shared service endpoints used to lazily load stock information for each bed.
 const PLANTS_IN_BED_LAYER_URL = 'https://arcgis.curtin.edu.au/arcgis/rest/services/Parks_Gardens/PropGIS_SDE_GardenBedsTEST_PlantsInBeds_/MapServer/0'
-const SPECIES_LAYER_URL = 'https://arcgis.curtin.edu.au/arcgis/rest/services/Parks_Gardens/PropGIS_SDE_GardenBedsTEST_Plant_Species_/MapServer/0'
+const SPECIES_LAYER_URL = 'https://arcgis.curtin.edu.au/arcgis/rest/services/Parks_Gardens/PropGIS_SDE_GardenBedsTEST_Plant_Species_/FeatureServer/0'
 const SELECTED_SPECIES_UID_KEY = 'gardenbeds:selectedSpeciesUid'
 const MASTER_WHERE = "status = 'Active' OR status IS NULL"
 const ACCENT_COLOR = '#007ac2'
@@ -51,11 +53,76 @@ const EMPTY_STATE_DETAIL_STYLE = {
   color: SECONDARY_TEXT_COLOR
 }
 const SECTION_LABEL_STYLE = {
-  fontSize: '0.78rem',
-  letterSpacing: '0.04em',
+  display: 'grid',
+  gridTemplateColumns: '4.75rem 1fr',
+  columnGap: '0.5rem',
+  alignItems: 'center',
+  marginBottom: '0.5rem',
+  paddingBottom: '0.35rem',
+  borderBottom: '1px solid #e6e6e6'
+}
+const CHECKBOX_STYLE = {
+  width: '0.95rem',
+  height: '0.95rem',
+  accentColor: ACCENT_COLOR,
+  cursor: 'pointer'
+}
+const ZONE_ROW_STYLE = {
+  display: 'grid',
+  gridTemplateColumns: '4.75rem 1fr',
+  columnGap: '0.5rem',
+  alignItems: 'start'
+}
+const ZONE_ISOLATE_HEADER_STYLE = {
+  fontSize: '0.72rem',
+  letterSpacing: '0.05em',
   textTransform: 'uppercase' as const,
-  color: '#6b6b6b',
-  marginBottom: '0.35rem'
+  color: SECONDARY_TEXT_COLOR,
+  fontWeight: 700,
+  textAlign: 'center' as const
+}
+const SECTION_TITLE_STYLE = {
+  fontSize: '0.88rem',
+  letterSpacing: '0.06em',
+  textTransform: 'uppercase' as const,
+  color: '#4d4d4d',
+  fontWeight: 700
+}
+const HELP_BUTTON_STYLE = {
+  ...PLAIN_BUTTON_STYLE,
+  width: '1.25rem',
+  height: '1.25rem',
+  borderRadius: '999px',
+  border: `1px solid ${ACCENT_COLOR}`,
+  color: ACCENT_COLOR,
+  fontSize: '0.78rem',
+  fontWeight: 700,
+  lineHeight: 1,
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  cursor: 'pointer'
+}
+const HELP_POPOVER_STYLE = {
+  position: 'absolute' as const,
+  top: '1.7rem',
+  left: 0,
+  zIndex: 2,
+  width: '15.5rem',
+  padding: '0.7rem 0.8rem',
+  backgroundColor: '#fff',
+  border: '1px solid #d6e7f2',
+  borderRadius: '6px',
+  boxShadow: '0 6px 18px rgba(0, 0, 0, 0.12)',
+  color: '#333',
+  fontSize: '0.82rem',
+  lineHeight: 1.45
+}
+const WIDGET_VERSION = 'v2026.04.10-1'
+
+const getTreeToggleIcon = (isExpanded: boolean): string =>
+{
+  return isExpanded ? 'v' : '>'
 }
 
 // A single bed entry rendered under a zone.
@@ -72,6 +139,7 @@ interface PlantLine {
   quantity: number
   costPerUnit: number
   unitType: string
+  usedSpeciesUidFallback: boolean
 }
 
 interface SpeciesGroup {
@@ -160,6 +228,11 @@ const getGardenUidFromRecord = (record: any): string =>
   return firstValue(getRecordAttributes(record), ['garden_uid', 'GARDEN_UID'])
 }
 
+const buildSqlInClause = (fieldName: string, values: string[]): string =>
+{
+  return `${fieldName} IN (${values.map((value) => `'${escapeSqlValue(value)}'`).join(', ')})`
+}
+
 const isMasterLayerMatch = (layerLike: any, dataSourceId?: string): boolean =>
 {
   const layerId = String(layerLike?.id || '')
@@ -240,30 +313,36 @@ const queryPlantLinesForBed = async (gardenUid: string): Promise<PlantLine[]> =>
     const speciesUids = Array.from(new Set(features
       .map((feature: any) => firstValue(feature?.attributes, ['species_uid', 'SPECIES_UID']))
       .filter((value: string) => value !== '')))
-
     const speciesNameByUid = new Map<string, string>()
 
     if (speciesUids.length > 0)
     {
-      const speciesQuery = new Query({
-        where: `species_uid IN (${speciesUids.map((speciesUid) => `'${escapeSqlValue(speciesUid)}'`).join(', ')})`,
-        outFields: ['species_uid', 'species_name', 'common_name'],
-        returnGeometry: false
-      })
-
-      const speciesResult = await executeQueryJSON(SPECIES_LAYER_URL, speciesQuery as any)
-
-      ;(speciesResult?.features || []).forEach((feature: any) =>
+      try
       {
-        const attributes = feature?.attributes || {}
-        const speciesUid = firstValue(attributes, ['species_uid', 'SPECIES_UID'])
-        const speciesName = firstValue(attributes, ['species_name', 'SPECIES_NAME', 'common_name', 'COMMON_NAME'])
+        const speciesQuery = new Query({
+          where: buildSqlInClause('species_uid', speciesUids),
+          outFields: ['species_uid', 'species_name', 'common_name'],
+          returnGeometry: false
+        })
 
-        if (speciesUid !== '')
+        const speciesResult = await executeQueryJSON(SPECIES_LAYER_URL, speciesQuery as any)
+
+        ;(speciesResult?.features || []).forEach((feature: any) =>
         {
-          speciesNameByUid.set(speciesUid, speciesName || speciesUid)
-        }
-      })
+          const attributes = feature?.attributes || {}
+          const speciesUid = firstValue(attributes, ['species_uid', 'SPECIES_UID'])
+          const speciesName = firstValue(attributes, ['species_name', 'SPECIES_NAME', 'common_name', 'COMMON_NAME'])
+
+          if (speciesUid !== '')
+          {
+            speciesNameByUid.set(speciesUid, speciesName || speciesUid)
+          }
+        })
+      }
+      catch (error)
+      {
+        console.warn(`Failed to load species lookup for garden_uid ${gardenUid}`, error)
+      }
     }
 
     return features
@@ -273,13 +352,15 @@ const queryPlantLinesForBed = async (gardenUid: string): Promise<PlantLine[]> =>
         const speciesUid = firstValue(attributes, ['species_uid', 'SPECIES_UID'])
         const quantity = Number(attributes?.current_quantity ?? attributes?.CURRENT_QUANTITY)
         const costPerUnit = Number(attributes?.cost_per_unit ?? attributes?.COST_PER_UNIT)
+        const speciesName = speciesNameByUid.get(speciesUid) || speciesUid
 
         return {
           speciesUid,
-          speciesName: speciesNameByUid.get(speciesUid) || speciesUid,
+          speciesName,
           quantity: Number.isFinite(quantity) ? quantity : 0,
           costPerUnit: Number.isFinite(costPerUnit) ? costPerUnit : 0,
-          unitType: firstValue(attributes, ['unit_type', 'UNIT_TYPE']) || ''
+          unitType: firstValue(attributes, ['unit_type', 'UNIT_TYPE']) || '',
+          usedSpeciesUidFallback: speciesName === speciesUid
         }
       })
       .sort((left, right) =>
@@ -379,6 +460,11 @@ const getSelectedBedRowStyle = (isSelected: boolean) =>
   }
 }
 
+const getExpandIcon = (isExpanded: boolean): string =>
+{
+  return isExpanded ? '▾' : '▸'
+}
+
 const Widget = (props: AllWidgetProps<any>) =>
 {
   const [masterDs, setMasterDs] = useState<DataSource | null>(null)
@@ -388,6 +474,8 @@ const Widget = (props: AllWidgetProps<any>) =>
   const [isLoadingZones, setIsLoadingZones] = useState(false)
   const [loadError, setLoadError] = useState('')
   const [zoneFilterText, setZoneFilterText] = useState('')
+  const [isolatedZones, setIsolatedZones] = useState<string[]>([])
+  const [showHelp, setShowHelp] = useState(false)
   const [selectedBedUid, setSelectedBedUid] = useState('')
   const [expandedZones, setExpandedZones] = useState<string[]>([])
   const [expandedBeds, setExpandedBeds] = useState<string[]>([])
@@ -614,6 +702,46 @@ const Widget = (props: AllWidgetProps<any>) =>
     return layerViewEntries.find((entry: any) => isMasterLayerMatch(entry, dataSourceId)) || null
   }
 
+  const applyZoneIsolationToMap = () =>
+  {
+    const matchingJimuLayerView = findMatchingJimuLayerView()
+    const jsApiLayerView = matchingJimuLayerView?.view as any
+    const jsApiLayer = matchingJimuLayerView?.layer || jsApiLayerView?.layer
+
+    if (!jsApiLayerView || !jsApiLayer)
+    {
+      return
+    }
+
+    if (isolatedZones.length === 0)
+    {
+      jsApiLayerView.filter = null
+      jsApiLayerView.featureEffect = null
+      return
+    }
+
+    const layerFields = Array.isArray(jsApiLayer.fields) ? jsApiLayer.fields : []
+    const zoneField =
+      layerFields.find((field: any) => String(field?.name || '').toLowerCase() === 'zone')?.name ||
+      layerFields.find((field: any) => String(field?.name || '').toLowerCase().endsWith('.zone'))?.name ||
+      null
+
+    if (!zoneField)
+    {
+      return
+    }
+
+    const zoneFilter = new FeatureFilter({
+      where: buildSqlInClause(zoneField, isolatedZones)
+    })
+
+    jsApiLayerView.filter = null
+    jsApiLayerView.featureEffect = new FeatureEffect({
+      filter: zoneFilter,
+      excludedEffect: 'opacity(0%)'
+    })
+  }
+
   // Opens the correct zone and bed so external selections can be revealed in the tree.
   const openBedInTree = (gardenUid: string) =>
   {
@@ -698,6 +826,13 @@ const Widget = (props: AllWidgetProps<any>) =>
     openBedInTree(gardenUid)
     clearMasterDataSourceSelection()
     selectBedRecordInDataSource(gardenUid)
+
+    if (selectedBedUid === gardenUid)
+    {
+      void syncMapToGardenBed(gardenUid)
+      return
+    }
+
     setSelectedBedUid(gardenUid)
   }
 
@@ -720,6 +855,7 @@ const Widget = (props: AllWidgetProps<any>) =>
     clearMasterDataSourceSelection()
     clearMapHighlight()
     clearMapViewSelectionState()
+    applyZoneIsolationToMap()
 
     try
     {
@@ -772,6 +908,8 @@ const Widget = (props: AllWidgetProps<any>) =>
       {
         jsApiMapView.popup.close()
       }
+
+      applyZoneIsolationToMap()
     }
     catch (error)
     {
@@ -791,6 +929,19 @@ const Widget = (props: AllWidgetProps<any>) =>
       }
 
       return [...previous, zone]
+    })
+  }
+
+  const toggleZoneIsolation = (zone: string) =>
+  {
+    setIsolatedZones((previous) =>
+    {
+      if (previous.includes(zone))
+      {
+        return previous.filter((value) => value !== zone)
+      }
+
+      return [...previous, zone].sort(compareZoneValues)
     })
   }
 
@@ -848,7 +999,12 @@ const Widget = (props: AllWidgetProps<any>) =>
     setExpandedPlantTotals([])
   }
 
-  // Applies a lightweight local zone filter without changing any shared datasource state.
+  const clearZoneIsolation = () =>
+  {
+    setIsolatedZones([])
+  }
+
+  // Applies a lightweight local zone text filter without changing any shared datasource state.
   const visibleZoneGroups = zoneGroups
     .filter((zoneGroup) =>
     {
@@ -965,6 +1121,12 @@ const Widget = (props: AllWidgetProps<any>) =>
 
     void syncMapToGardenBed(selectedBedUid)
   }, [selectedBedUid, jimuMapView, masterDs])
+
+  // Applies zone isolate to the connected map only, leaving the tree unchanged.
+  useEffect(() =>
+  {
+    applyZoneIsolationToMap()
+  }, [isolatedZones, selectedBedUid, jimuMapView, masterDs])
 
   // Keeps the active bed visible in the scrollable tree when selection changes.
   useEffect(() =>
@@ -1148,10 +1310,33 @@ const Widget = (props: AllWidgetProps<any>) =>
         }}
       >
         <div>
-          <h3 style={{ margin: 0, fontSize: '1.1rem', fontWeight: 700 }}>Plant Explorer</h3>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: '0.5rem' }}>
+            <h3 style={{ margin: 0, fontSize: '1.1rem', fontWeight: 700 }}>Plant Explorer</h3>
+            <span style={{ fontSize: '0.78rem', color: SECONDARY_TEXT_COLOR }}>{WIDGET_VERSION}</span>
+          </div>
         </div>
 
         <div style={{ whiteSpace: 'nowrap', fontSize: '0.9rem', marginTop: '0.15rem' }}>
+          <button
+            type="button"
+            className="btn btn-link p-0"
+            style={{
+              ...PLAIN_BUTTON_STYLE,
+              color: isolatedZones.length > 0 ? ACCENT_COLOR : SECONDARY_TEXT_COLOR,
+              textDecoration: isolatedZones.length > 0 ? 'underline' : 'none',
+              cursor: isolatedZones.length > 0 ? 'pointer' : 'default'
+            }}
+            onClick={() =>
+            {
+              if (isolatedZones.length > 0)
+              {
+                clearZoneIsolation()
+              }
+            }}
+          >
+            Clear Isolate
+          </button>
+          <span style={{ color: '#888', margin: '0 0.4rem' }}>|</span>
           <button
             type="button"
             className="btn btn-link p-0"
@@ -1260,28 +1445,69 @@ const Widget = (props: AllWidgetProps<any>) =>
         {!isLoadingZones && loadError === '' && visibleZoneGroups.length > 0 && (
           <div>
             <div style={SECTION_LABEL_STYLE}>
-              Zones
+              <div style={ZONE_ISOLATE_HEADER_STYLE}>Isolate</div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', position: 'relative' }}>
+                <span style={SECTION_TITLE_STYLE}>Zones</span>
+                <button
+                  type="button"
+                  className="btn btn-link p-0"
+                  style={HELP_BUTTON_STYLE}
+                  aria-label="Help"
+                  onClick={() =>
+                  {
+                    setShowHelp((previous) => !previous)
+                  }}
+                >
+                  ?
+                </button>
+                {showHelp && (
+                  <div style={HELP_POPOVER_STYLE}>
+                    <div style={{ fontWeight: 700, marginBottom: '0.35rem' }}>How this works</div>
+                    <div>Use the `Isolate` checkboxes to show only selected zones on the map.</div>
+                    <div style={{ marginTop: '0.35rem' }}>Use the arrow controls to expand or collapse zones, beds, and species in the tree.</div>
+                  </div>
+                )}
+              </div>
             </div>
             <div className="mt-2">
               {visibleZoneGroups.map((zoneGroup) => (
                 <div key={zoneGroup.zone} className="mb-3">
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                    <button
-                      type="button"
-                      className="btn btn-link p-0"
-                      style={TREE_TOGGLE_STYLE}
-                      onClick={() =>
-                      {
-                        toggleZone(zoneGroup.zone)
-                      }}
-                    >
-                      {expandedZones.includes(zoneGroup.zone) ? '-' : '+'}
-                    </button>
-                    <strong style={{ fontSize: '0.98rem' }}>{zoneGroup.zone}</strong>
+                  <div style={ZONE_ROW_STYLE}>
+                    <div style={{ display: 'flex', justifyContent: 'center', paddingTop: '0.1rem' }}>
+                      <input
+                        type="checkbox"
+                        checked={isolatedZones.includes(zoneGroup.zone)}
+                        onChange={() =>
+                        {
+                          toggleZoneIsolation(zoneGroup.zone)
+                        }}
+                        aria-label={`Isolate zone ${zoneGroup.zone}`}
+                        style={CHECKBOX_STYLE}
+                      />
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                      <button
+                        type="button"
+                        className="btn btn-link p-0"
+                        style={{
+                          ...TREE_TOGGLE_STYLE,
+                          fontSize: '0.95rem',
+                          color: '#555'
+                        }}
+                        onClick={() =>
+                        {
+                          toggleZone(zoneGroup.zone)
+                        }}
+                        aria-label={`${expandedZones.includes(zoneGroup.zone) ? 'Collapse' : 'Expand'} zone ${zoneGroup.zone}`}
+                      >
+                        {getTreeToggleIcon(expandedZones.includes(zoneGroup.zone))}
+                      </button>
+                      <strong style={{ fontSize: '0.98rem' }}>{zoneGroup.zone}</strong>
+                    </div>
                   </div>
 
                   {expandedZones.includes(zoneGroup.zone) && (
-                    <div className="mb-0 mt-1" style={{ marginLeft: '1.25rem' }}>
+                    <div className="mb-0 mt-1" style={{ marginLeft: '5.9rem' }}>
                       {zoneGroup.beds.map((bed) => (
                         <div
                           key={bed.gardenUid}
@@ -1295,13 +1521,18 @@ const Widget = (props: AllWidgetProps<any>) =>
                             <button
                               type="button"
                               className="btn btn-link p-0"
-                              style={TREE_TOGGLE_STYLE}
+                              style={{
+                                ...TREE_TOGGLE_STYLE,
+                                fontSize: '0.95rem',
+                                color: '#555'
+                              }}
                               onClick={() =>
                               {
                                 toggleBed(bed.gardenUid)
                               }}
+                              aria-label={`${expandedBeds.includes(bed.gardenUid) ? 'Collapse' : 'Expand'} bed ${bed.bedNo}`}
                             >
-                              {expandedBeds.includes(bed.gardenUid) ? '-' : '+'}
+                              {getTreeToggleIcon(expandedBeds.includes(bed.gardenUid))}
                             </button>
                             <span style={{ fontWeight: selectedBedUid === bed.gardenUid ? 700 : 500, color: selectedBedUid === bed.gardenUid ? '#0b4f79' : '#222' }}>
                               Bed {bed.bedNo} ({bed.area !== '' ? `${Math.round(Number(bed.area)).toLocaleString()} sq m` : 'Area not available'})
@@ -1340,7 +1571,7 @@ const Widget = (props: AllWidgetProps<any>) =>
                                     togglePlantTotals(bed.gardenUid)
                                   }}
                                 >
-                                  {expandedPlantTotals.includes(bed.gardenUid) ? '-' : '+'}
+                                  {getTreeToggleIcon(expandedPlantTotals.includes(bed.gardenUid))}
                                 </button>
                                 {' '}
                                 Total Plants: {loadingBedTotals[bed.gardenUid]
@@ -1349,6 +1580,35 @@ const Widget = (props: AllWidgetProps<any>) =>
                               </div>
                               {expandedPlantTotals.includes(bed.gardenUid) && (
                                 <div style={{ marginLeft: '1.35rem', marginTop: '0.15rem' }}>
+                                  {!loadingBedPlantLines[bed.gardenUid] && (bedPlantLines[bed.gardenUid] || []).some((plantLine) => plantLine.usedSpeciesUidFallback) && (
+                                    <div
+                                      style={{
+                                        marginBottom: '0.45rem',
+                                        padding: '0.45rem 0.55rem',
+                                        border: `1px solid ${DANGER_TEXT_COLOR}`,
+                                        borderRadius: '4px',
+                                        backgroundColor: '#fff5f5',
+                                        color: DANGER_TEXT_COLOR,
+                                        fontSize: '0.78rem',
+                                        lineHeight: 1.4
+                                      }}
+                                    >
+                                      Species names could not be resolved for one or more plant lines in Bed {bed.bedNo}, so `species_uid` is being shown instead.
+                                      {' '}
+                                      This happens when the species lookup did not return a matching name for one or more `species_uid` values.
+                                      <div style={{ marginTop: '0.3rem', wordBreak: 'break-all' }}>
+                                        Unresolved `species_uid` values:
+                                        {' '}
+                                        {Array.from(new Set((bedPlantLines[bed.gardenUid] || [])
+                                          .filter((plantLine) => plantLine.usedSpeciesUidFallback)
+                                          .map((plantLine) => plantLine.speciesUid)))
+                                          .join(', ')}
+                                      </div>
+                                      <div style={{ marginTop: '0.3rem' }}>
+                                      Please contact gis.properties@curtin.edu.au for assistance.
+                                      </div>
+                                    </div>
+                                  )}
                                   {loadingBedPlantLines[bed.gardenUid] && (
                                     <div style={{ color: MUTED_TEXT_COLOR }}>Loading plant lines...</div>
                                   )}
@@ -1369,13 +1629,18 @@ const Widget = (props: AllWidgetProps<any>) =>
                                               <button
                                                 type="button"
                                                 className="btn btn-link p-0"
-                                                style={TREE_TOGGLE_STYLE}
+                                                style={{
+                                                  ...TREE_TOGGLE_STYLE,
+                                                  fontSize: '0.95rem',
+                                                  color: '#555'
+                                                }}
                                                 onClick={() =>
                                                 {
                                                   toggleSpeciesGroup(speciesGroupKey)
                                                 }}
+                                                aria-label={`${isExpanded ? 'Collapse' : 'Expand'} species ${speciesGroup.speciesName}`}
                                               >
-                                                {isExpanded ? '-' : '+'}
+                                                {getTreeToggleIcon(isExpanded)}
                                               </button>
                                               <div
                                                 style={{
