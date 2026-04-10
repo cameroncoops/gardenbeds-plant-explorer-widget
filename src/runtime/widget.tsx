@@ -11,9 +11,9 @@ import {
 } from 'jimu-arcgis'
 import FeatureEffect from 'esri/layers/support/FeatureEffect'
 import FeatureFilter from 'esri/layers/support/FeatureFilter'
-import { buildSqlInClause, firstValue, getGardenUidFromRecord, getRecordAttributes, escapeSqlValue } from './lib/field-helpers'
-import { queryPlantLinesForBed, queryPlantsInBedTotal } from './lib/plant-queries'
-import type { PlantLine } from './lib/plant-types'
+import { buildSqlInClause, firstValue, getGardenUidFromRecord, escapeSqlValue } from './lib/field-helpers'
+import { queryGardenUidsForSpecies, queryPlantLinesForBed, queryPlantsInBedTotal, querySpeciesOptions } from './lib/plant-queries'
+import type { PlantLine, SpeciesOption } from './lib/plant-types'
 import { SELECTED_SPECIES_UID_KEY } from './lib/service-urls'
 
 const { useEffect, useState } = React
@@ -29,7 +29,11 @@ const TREE_TOGGLE_STYLE = {
   color: '#444',
   textDecoration: 'none',
   fontWeight: 700,
-  minWidth: '1rem'
+  minWidth: '0.8rem',
+  width: '0.8rem',
+  padding: 0,
+  fontSize: '0.72rem',
+  lineHeight: 1
 }
 const LINK_BUTTON_STYLE = {
   background: 'none',
@@ -116,11 +120,11 @@ const HELP_POPOVER_STYLE = {
   fontSize: '0.82rem',
   lineHeight: 1.45
 }
-const WIDGET_VERSION = 'v2026.04.10-3'
+const WIDGET_VERSION = 'v2026.04.10-9'
 
 const getTreeToggleIcon = (isExpanded: boolean): string =>
 {
-  return isExpanded ? 'v' : '>'
+  return isExpanded ? '▼' : '▶'
 }
 
 // A single bed entry rendered under a zone.
@@ -308,6 +312,11 @@ const Widget = (props: AllWidgetProps<any>) =>
   const [zoneFilterText, setZoneFilterText] = useState('')
   const [isolatedZones, setIsolatedZones] = useState<string[]>([])
   const [showHelp, setShowHelp] = useState(false)
+  const [speciesOptions, setSpeciesOptions] = useState<SpeciesOption[]>([])
+  const [isLoadingSpeciesOptions, setIsLoadingSpeciesOptions] = useState(false)
+  const [speciesLoadError, setSpeciesLoadError] = useState('')
+  const [isLoadingSpeciesBeds, setIsLoadingSpeciesBeds] = useState(false)
+  const [filteredGardenUidsForSpecies, setFilteredGardenUidsForSpecies] = useState<string[] | null>(null)
   const [selectedBedUid, setSelectedBedUid] = useState('')
   const [expandedZones, setExpandedZones] = useState<string[]>([])
   const [expandedBeds, setExpandedBeds] = useState<string[]>([])
@@ -324,10 +333,25 @@ const Widget = (props: AllWidgetProps<any>) =>
   const bedRowRefs = React.useRef<Record<string, HTMLDivElement | null>>({})
   const normalizedZoneFilterText = normalizeFilterValue(zoneFilterText)
 
-  // Reads the currently selected species written by the Species Filter widget.
+  // Reads the currently selected species from session storage so the widget can
+  // preserve the user's last species filter choice across reloads.
   const syncSelectedSpeciesUidFromSession = () =>
   {
     setSelectedSpeciesUid(sessionStorage.getItem(SELECTED_SPECIES_UID_KEY) || '')
+  }
+
+  const applySelectedSpeciesUid = (speciesUid: string) =>
+  {
+    setSelectedSpeciesUid(speciesUid)
+
+    if (speciesUid !== '')
+    {
+      sessionStorage.setItem(SELECTED_SPECIES_UID_KEY, speciesUid)
+    }
+    else
+    {
+      sessionStorage.removeItem(SELECTED_SPECIES_UID_KEY)
+    }
   }
 
   // Rebuilds the displayed hierarchy from the records currently loaded in the shared master datasource.
@@ -452,6 +476,7 @@ const Widget = (props: AllWidgetProps<any>) =>
 
       return next
     })
+    setSelectedBedUid((previous) => availableBeds.has(previous) ? previous : '')
   }
 
   // Removes the current map highlight when the selected bed changes or the widget unmounts.
@@ -545,26 +570,60 @@ const Widget = (props: AllWidgetProps<any>) =>
       return
     }
 
-    if (isolatedZones.length === 0)
+    const layerFields = Array.isArray(jsApiLayer.fields) ? jsApiLayer.fields : []
+    const whereClauses: string[] = []
+
+    if (filteredGardenUidsForSpecies !== null)
+    {
+      const gardenUidField =
+        layerFields.find((field: any) => String(field?.name || '').toLowerCase() === 'garden_uid')?.name ||
+        layerFields.find((field: any) => String(field?.name || '').toLowerCase().endsWith('.garden_uid'))?.name ||
+        null
+
+      if (!gardenUidField)
+      {
+        return
+      }
+
+      if (filteredGardenUidsForSpecies.length === 0)
+      {
+        jsApiLayerView.filter = null
+        jsApiLayerView.featureEffect = new FeatureEffect({
+          filter: new FeatureFilter({
+            where: '1=2'
+          }),
+          excludedEffect: 'opacity(0%)'
+        })
+        return
+      }
+
+      whereClauses.push(buildSqlInClause(gardenUidField, filteredGardenUidsForSpecies))
+    }
+
+    if (isolatedZones.length === 0 && whereClauses.length === 0)
     {
       jsApiLayerView.filter = null
       jsApiLayerView.featureEffect = null
       return
     }
 
-    const layerFields = Array.isArray(jsApiLayer.fields) ? jsApiLayer.fields : []
     const zoneField =
       layerFields.find((field: any) => String(field?.name || '').toLowerCase() === 'zone')?.name ||
       layerFields.find((field: any) => String(field?.name || '').toLowerCase().endsWith('.zone'))?.name ||
       null
 
-    if (!zoneField)
+    if (isolatedZones.length > 0 && !zoneField)
     {
       return
     }
 
+    if (isolatedZones.length > 0)
+    {
+      whereClauses.push(buildSqlInClause(zoneField as string, isolatedZones))
+    }
+
     const zoneFilter = new FeatureFilter({
-      where: buildSqlInClause(zoneField, isolatedZones)
+      where: whereClauses.length === 1 ? whereClauses[0] : whereClauses.map((clause) => `(${clause})`).join(' AND ')
     })
 
     jsApiLayerView.filter = null
@@ -838,9 +897,21 @@ const Widget = (props: AllWidgetProps<any>) =>
 
   // Applies a lightweight local zone text filter without changing any shared datasource state.
   const visibleZoneGroups = zoneGroups
+    .map((zoneGroup) =>
+    {
+      const filteredBeds = filteredGardenUidsForSpecies === null
+        ? zoneGroup.beds
+        : zoneGroup.beds.filter((bed) => filteredGardenUidsForSpecies.includes(bed.gardenUid))
+
+      return {
+        ...zoneGroup,
+        beds: filteredBeds
+      }
+    })
     .filter((zoneGroup) =>
     {
-      return normalizedZoneFilterText === '' || normalizeFilterValue(zoneGroup.zone).includes(normalizedZoneFilterText)
+      return zoneGroup.beds.length > 0 &&
+        (normalizedZoneFilterText === '' || normalizeFilterValue(zoneGroup.zone).includes(normalizedZoneFilterText))
     })
 
   // Loads bed-level plant totals only for beds that are currently expanded.
@@ -848,6 +919,80 @@ const Widget = (props: AllWidgetProps<any>) =>
   {
     syncSelectedSpeciesUidFromSession()
   }, [])
+
+  useEffect(() =>
+  {
+    const loadSpeciesOptions = async () =>
+    {
+      setIsLoadingSpeciesOptions(true)
+      setSpeciesLoadError('')
+
+      try
+      {
+        const loadedSpeciesOptions = await querySpeciesOptions()
+        setSpeciesOptions(loadedSpeciesOptions)
+      }
+      catch (error)
+      {
+        console.warn('Failed to load species options for Plant Explorer', error)
+        setSpeciesLoadError('Failed to load species options.')
+        setSpeciesOptions([])
+      }
+      finally
+      {
+        setIsLoadingSpeciesOptions(false)
+      }
+    }
+
+    void loadSpeciesOptions()
+  }, [])
+
+  useEffect(() =>
+  {
+    const syncSpeciesFilter = async () =>
+    {
+      if (selectedSpeciesUid === '')
+      {
+        setFilteredGardenUidsForSpecies(null)
+        setIsLoadingSpeciesBeds(false)
+        return
+      }
+
+      setIsLoadingSpeciesBeds(true)
+
+      try
+      {
+        const matchingGardenUids = await queryGardenUidsForSpecies(selectedSpeciesUid)
+
+        if (matchingGardenUids.length === 0)
+        {
+          setFilteredGardenUidsForSpecies([])
+          return
+        }
+
+        setFilteredGardenUidsForSpecies(matchingGardenUids)
+      }
+      catch (error)
+      {
+        console.warn(`Failed to apply species filter for species_uid ${selectedSpeciesUid}`, error)
+        setFilteredGardenUidsForSpecies([])
+      }
+      finally
+      {
+        setIsLoadingSpeciesBeds(false)
+      }
+    }
+
+    void syncSpeciesFilter()
+  }, [selectedSpeciesUid])
+
+  useEffect(() =>
+  {
+    if (selectedBedUid !== '' && filteredGardenUidsForSpecies !== null && !filteredGardenUidsForSpecies.includes(selectedBedUid))
+    {
+      setSelectedBedUid('')
+    }
+  }, [selectedBedUid, filteredGardenUidsForSpecies])
 
   useEffect(() =>
   {
@@ -958,7 +1103,7 @@ const Widget = (props: AllWidgetProps<any>) =>
   useEffect(() =>
   {
     applyZoneIsolationToMap()
-  }, [isolatedZones, selectedBedUid, jimuMapView, masterDs])
+  }, [isolatedZones, selectedBedUid, jimuMapView, masterDs, filteredGardenUidsForSpecies])
 
   // Keeps the active bed visible in the scrollable tree when selection changes.
   useEffect(() =>
@@ -1147,26 +1292,115 @@ const Widget = (props: AllWidgetProps<any>) =>
       </div>
 
       <div style={{ flex: '0 0 auto', marginBottom: '0.75rem' }}>
-        <input
-          type="text"
-          value={zoneFilterText}
-          placeholder="Filter zones"
-          onChange={(event) =>
-          {
-            setZoneFilterText(event.target.value)
-          }}
-          style={{
-            width: '52%',
-            minWidth: '11rem',
-            maxWidth: '20rem',
-            padding: '0.5rem 0.65rem',
-            border: '1px solid #d0d0d0',
-            borderRadius: '4px',
-            fontSize: '0.92rem',
-            color: '#222',
-            backgroundColor: '#fff'
-          }}
-        />
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: '0.75rem', flexWrap: 'wrap', marginBottom: '0.65rem' }}>
+          <div style={{ width: '52%', minWidth: '11rem', maxWidth: '20rem' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
+            <select
+              id="plant-explorer-species-filter"
+              value={selectedSpeciesUid}
+              disabled={isLoadingSpeciesOptions}
+              onChange={(event) =>
+              {
+                applySelectedSpeciesUid(event.target.value)
+              }}
+              style={{
+                flex: '1 1 auto',
+                minWidth: 0,
+                padding: '0.5rem 0.65rem',
+                border: '1px solid #d0d0d0',
+                borderRadius: '4px',
+                fontSize: '0.92rem',
+                color: '#222',
+                backgroundColor: '#fff'
+            }}
+          >
+            <option value="">
+                {isLoadingSpeciesOptions ? 'Loading species...' : 'Filter by species'}
+            </option>
+            {speciesOptions.map((speciesOption) =>
+            {
+                return (
+                  <option key={speciesOption.speciesUid} value={speciesOption.speciesUid}>
+                    {speciesOption.speciesName}
+                  </option>
+                )
+              })}
+            </select>
+            <button
+              type="button"
+              className="btn btn-link p-0"
+              style={{
+                ...PLAIN_BUTTON_STYLE,
+                color: selectedSpeciesUid !== '' ? ACCENT_COLOR : SECONDARY_TEXT_COLOR,
+                textDecoration: selectedSpeciesUid !== '' ? 'underline' : 'none',
+                cursor: selectedSpeciesUid !== '' ? 'pointer' : 'default',
+                whiteSpace: 'nowrap'
+              }}
+              onClick={() =>
+              {
+                if (selectedSpeciesUid !== '')
+                {
+                  applySelectedSpeciesUid('')
+                }
+              }}
+            >
+              Clear
+            </button>
+          </div>
+          {speciesLoadError !== '' && (
+            <div style={{ marginTop: '0.3rem', fontSize: '0.8rem', color: DANGER_TEXT_COLOR }}>
+              {speciesLoadError}
+            </div>
+          )}
+          {selectedSpeciesUid !== '' && (
+            <div style={{ marginTop: '0.3rem', fontSize: '0.8rem', color: SECONDARY_TEXT_COLOR }}>
+              {isLoadingSpeciesBeds ? 'Filtering beds...' : 'Species filter is active.'}
+            </div>
+          )}
+          </div>
+
+          <div style={{ width: '34%', minWidth: '8.5rem', maxWidth: '14rem', display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
+            <input
+              type="text"
+              value={zoneFilterText}
+              placeholder="Filter zones"
+              onChange={(event) =>
+              {
+                setZoneFilterText(event.target.value)
+              }}
+              style={{
+                flex: '1 1 auto',
+                minWidth: 0,
+                padding: '0.5rem 0.65rem',
+                border: '1px solid #d0d0d0',
+                borderRadius: '4px',
+                fontSize: '0.92rem',
+                color: '#222',
+                backgroundColor: '#fff'
+              }}
+            />
+            <button
+              type="button"
+              className="btn btn-link p-0"
+              style={{
+                ...PLAIN_BUTTON_STYLE,
+                color: zoneFilterText !== '' ? ACCENT_COLOR : SECONDARY_TEXT_COLOR,
+                textDecoration: zoneFilterText !== '' ? 'underline' : 'none',
+                cursor: zoneFilterText !== '' ? 'pointer' : 'default',
+                whiteSpace: 'nowrap'
+              }}
+              onClick={() =>
+              {
+                if (zoneFilterText !== '')
+                {
+                  setZoneFilterText('')
+                }
+              }}
+            >
+              Clear
+            </button>
+          </div>
+        </div>
         <div style={{ whiteSpace: 'nowrap', fontSize: '0.9rem', marginTop: '0.45rem' }}>
           <button
             type="button"
