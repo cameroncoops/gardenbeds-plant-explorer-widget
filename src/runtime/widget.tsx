@@ -116,7 +116,7 @@ const HELP_POPOVER_STYLE = {
   fontSize: '0.82rem',
   lineHeight: 1.45
 }
-const WIDGET_VERSION = 'v2026.04.10-2'
+const WIDGET_VERSION = 'v2026.04.10-3'
 
 const getTreeToggleIcon = (isExpanded: boolean): string =>
 {
@@ -1134,10 +1134,6 @@ const Widget = (props: AllWidgetProps<any>) =>
       <div
         style={{
           flex: '0 0 auto',
-          display: 'flex',
-          justifyContent: 'space-between',
-          alignItems: 'flex-start',
-          gap: '1rem',
           marginBottom: '0.75rem'
         }}
       >
@@ -1148,7 +1144,30 @@ const Widget = (props: AllWidgetProps<any>) =>
           </div>
         </div>
 
-        <div style={{ whiteSpace: 'nowrap', fontSize: '0.9rem', marginTop: '0.15rem' }}>
+      </div>
+
+      <div style={{ flex: '0 0 auto', marginBottom: '0.75rem' }}>
+        <input
+          type="text"
+          value={zoneFilterText}
+          placeholder="Filter zones"
+          onChange={(event) =>
+          {
+            setZoneFilterText(event.target.value)
+          }}
+          style={{
+            width: '52%',
+            minWidth: '11rem',
+            maxWidth: '20rem',
+            padding: '0.5rem 0.65rem',
+            border: '1px solid #d0d0d0',
+            borderRadius: '4px',
+            fontSize: '0.92rem',
+            color: '#222',
+            backgroundColor: '#fff'
+          }}
+        />
+        <div style={{ whiteSpace: 'nowrap', fontSize: '0.9rem', marginTop: '0.45rem' }}>
           <button
             type="button"
             className="btn btn-link p-0"
@@ -1207,27 +1226,6 @@ const Widget = (props: AllWidgetProps<any>) =>
             Expand All
           </button>
         </div>
-      </div>
-
-      <div style={{ flex: '0 0 auto', marginBottom: '0.75rem' }}>
-        <input
-          type="text"
-          value={zoneFilterText}
-          placeholder="Filter zones"
-          onChange={(event) =>
-          {
-            setZoneFilterText(event.target.value)
-          }}
-          style={{
-            width: '100%',
-            padding: '0.5rem 0.65rem',
-            border: '1px solid #d0d0d0',
-            borderRadius: '4px',
-            fontSize: '0.92rem',
-            color: '#222',
-            backgroundColor: '#fff'
-          }}
-        />
       </div>
 
       <div
