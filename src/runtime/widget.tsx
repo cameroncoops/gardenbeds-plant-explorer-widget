@@ -1,3 +1,42 @@
+/**
+ * Plant Explorer widget
+ * =====================
+ *
+ * Purpose
+ * -------
+ * This widget displays the current garden bed hierarchy and the current plant
+ * stock held in each bed.
+ *
+ * Backend data model
+ * ------------------
+ * - GardenBedsTransactions is the backend source of truth.
+ * - GardenBeds_Active is the backend-derived current-state bed layer.
+ * - PlantsInBeds is the backend-derived current stock summary.
+ *
+ * Frontend data model
+ * -------------------
+ * - This widget reads the configured current bed layer through the shared
+ *   Experience Builder datasource.
+ * - It reads PlantsInBeds and Plant_Species directly through REST queries in
+ *   plant-queries.ts.
+ * - It does not reconstruct current beds from transactions in the browser.
+ *
+ * Core behavior
+ * -------------
+ * 1. Build a zones -> beds tree from the configured current bed datasource.
+ * 2. Keep tree selection, datasource selection, and map selection in sync.
+ * 3. Let the user filter by zone text and species.
+ * 4. Let the user isolate zones on the map without changing datasource state.
+ * 5. Lazily load plant totals and detailed stock lines only when a bed is expanded.
+ *
+ * Important assumptions
+ * ---------------------
+ * - The configured datasource should be the published current bed layer
+ *   (for example GardenBedsTEST_Active).
+ * - The bed datasource must expose garden_uid, zone, and bed_no.
+ * - PlantsInBeds and Plant_Species service URLs are configured in service-urls.ts.
+ */
+
 import {
   React,
   type AllWidgetProps,
@@ -18,7 +57,14 @@ import { SELECTED_SPECIES_UID_KEY } from './lib/service-urls'
 
 const { useEffect, useState } = React
 
-const MASTER_WHERE = "status = 'Active' OR status IS NULL"
+// Fallback title/URL fragments used when Experience Builder does not give us a
+// clean datasource id match for the configured current bed layer.
+const CURRENT_BED_LAYER_HINTS = [
+  'gardenbedstest_active',
+  'gardenbeds active',
+  'gardenbeds_active',
+  'gardenbedsactive'
+]
 const ACCENT_COLOR = '#007ac2'
 const MUTED_TEXT_COLOR = '#666'
 const SECONDARY_TEXT_COLOR = '#8a8a8a'
@@ -120,8 +166,9 @@ const HELP_POPOVER_STYLE = {
   fontSize: '0.82rem',
   lineHeight: 1.45
 }
-const WIDGET_VERSION = 'v2026.04.10-9'
+const WIDGET_VERSION = 'v2026.04.20-1'
 
+// Shared arrow icon used throughout the hierarchy tree.
 const getTreeToggleIcon = (isExpanded: boolean): string =>
 {
   return isExpanded ? '▼' : '▶'
@@ -188,7 +235,7 @@ const normalizeFilterValue = (value: string): string =>
   return value.trim().toLowerCase()
 }
 
-const isMasterLayerMatch = (layerLike: any, dataSourceId?: string): boolean =>
+const isConfiguredBedLayerMatch = (layerLike: any, dataSourceId?: string): boolean =>
 {
   const layerId = String(layerLike?.id || '')
   const layerDataSourceId =
@@ -216,10 +263,10 @@ const isMasterLayerMatch = (layerLike: any, dataSourceId?: string): boolean =>
 
   return (
     (dataSourceId ? layerDataSourceId === dataSourceId || layerId.includes(dataSourceId) : false) ||
-    String(layerTitle).toLowerCase().includes('gardenbedstest_master') ||
-    String(layerTitle).toLowerCase().includes('gardenbeds master') ||
-    String(layerUrl).toLowerCase().includes('gardenbedstest_master') ||
-    String(layerUrl).toLowerCase().includes('gardenbeds_master')
+    CURRENT_BED_LAYER_HINTS.some((hint) =>
+    {
+      return String(layerTitle).toLowerCase().includes(hint) || String(layerUrl).toLowerCase().includes(hint)
+    })
   )
 }
 
@@ -303,10 +350,11 @@ const getExpandIcon = (isExpanded: boolean): string =>
 
 const Widget = (props: AllWidgetProps<any>) =>
 {
-  const [masterDs, setMasterDs] = useState<DataSource | null>(null)
+  // Shared Experience Builder datasource for the published current bed layer.
+  const [bedDs, setBedDs] = useState<DataSource | null>(null)
   const [jimuMapView, setJimuMapView] = useState<JimuMapView | null>(null)
   const [zoneGroups, setZoneGroups] = useState<ZoneGroup[]>([])
-  const [hasLoadedMasterRecords, setHasLoadedMasterRecords] = useState(false)
+  const [hasLoadedBedRecords, setHasLoadedBedRecords] = useState(false)
   const [isLoadingZones, setIsLoadingZones] = useState(false)
   const [loadError, setLoadError] = useState('')
   const [zoneFilterText, setZoneFilterText] = useState('')
@@ -354,12 +402,13 @@ const Widget = (props: AllWidgetProps<any>) =>
     }
   }
 
-  // Rebuilds the displayed hierarchy from the records currently loaded in the shared master datasource.
-  // This makes Plant Explorer react to filters applied by other widgets, such as Species Filter.
+  // Rebuild the visible zone/bed tree from the records currently loaded in the
+  // shared current-bed datasource. This lets Plant Explorer react to filters or
+  // selections applied elsewhere in the app.
   const rebuildZoneGroupsFromDataSource = (dataSource: DataSource) =>
   {
     const records = dataSource.getRecords ? dataSource.getRecords() : []
-    setHasLoadedMasterRecords((records || []).length > 0)
+    setHasLoadedBedRecords((records || []).length > 0)
     const zoneMap = new Map<string, BedItem[]>()
 
     ;(records || []).forEach((record: any) =>
@@ -368,7 +417,7 @@ const Widget = (props: AllWidgetProps<any>) =>
       const gardenUid = firstValue(attributes, ['garden_uid', 'GARDEN_UID'])
       const zoneValue = firstValue(attributes, ['zone', 'ZONE'])
       const bedNo = firstValue(attributes, ['bed_no', 'BED_NO'])
-      const area = firstValue(attributes, ['Shape__Area'])
+      const area = firstValue(attributes, ['Shape__Area', 'Shape_Area', 'shape_area', 'SHAPE__AREA', 'SHAPE_AREA'])
 
       if (gardenUid === '' || zoneValue === '' || bedNo === '')
       {
@@ -489,6 +538,7 @@ const Widget = (props: AllWidgetProps<any>) =>
     }
   }
 
+  // Remove the map click handler when the active map changes or the widget unmounts.
   const clearMapClickHandle = () =>
   {
     if (mapClickHandleRef.current)
@@ -518,10 +568,10 @@ const Widget = (props: AllWidgetProps<any>) =>
     }
   }
 
-  // Clears shared datasource selection for the configured master layer.
-  const clearMasterDataSourceSelection = () =>
+  // Clear any shared Experience Builder selection against the configured bed layer.
+  const clearBedDataSourceSelection = () =>
   {
-    const dataSourceLike = masterDs as any
+    const dataSourceLike = bedDs as any
 
     if (dataSourceLike && typeof dataSourceLike.clearSelection === 'function')
     {
@@ -537,17 +587,17 @@ const Widget = (props: AllWidgetProps<any>) =>
     }
   }
 
-  // Locates the configured master layer inside the connected map widget.
+  // Locate the configured current-bed layer inside the connected map widget.
   const findMatchingJimuLayerView = () =>
   {
-    if (!jimuMapView || !masterDs)
+    if (!jimuMapView || !bedDs)
     {
       return null
     }
 
     const dataSourceId =
       (props.useDataSources && props.useDataSources[0] && (props.useDataSources[0] as any).dataSourceId) ||
-      (masterDs as any)?.id
+      (bedDs as any)?.id
 
     if (!dataSourceId)
     {
@@ -556,7 +606,7 @@ const Widget = (props: AllWidgetProps<any>) =>
 
     const layerViewEntries = Object.values((jimuMapView as any).jimuLayerViews || {})
 
-    return layerViewEntries.find((entry: any) => isMasterLayerMatch(entry, dataSourceId)) || null
+    return layerViewEntries.find((entry: any) => isConfiguredBedLayerMatch(entry, dataSourceId)) || null
   }
 
   const applyZoneIsolationToMap = () =>
@@ -661,15 +711,15 @@ const Widget = (props: AllWidgetProps<any>) =>
     })
   }
 
-  // Pushes a selected bed back into the shared ExB datasource selection state.
+  // Push a selected bed back into Experience Builder's shared datasource selection.
   const selectBedRecordInDataSource = (gardenUid: string) =>
   {
-    if (!masterDs || gardenUid === '')
+    if (!bedDs || gardenUid === '')
     {
       return
     }
 
-    const records = masterDs.getRecords ? masterDs.getRecords() : []
+    const records = bedDs.getRecords ? bedDs.getRecords() : []
     const matchingRecord = (records || []).find((record: any) =>
     {
       return getGardenUidFromRecord(record) === gardenUid
@@ -685,9 +735,9 @@ const Widget = (props: AllWidgetProps<any>) =>
       matchingRecord.id ||
       ''
 
-    if (recordId !== '' && typeof (masterDs as any).selectRecordsByIds === 'function')
+    if (recordId !== '' && typeof (bedDs as any).selectRecordsByIds === 'function')
     {
-      ;(masterDs as any).selectRecordsByIds([String(recordId)], [matchingRecord])
+      ;(bedDs as any).selectRecordsByIds([String(recordId)], [matchingRecord])
     }
   }
 
@@ -715,7 +765,7 @@ const Widget = (props: AllWidgetProps<any>) =>
   const selectBed = (gardenUid: string) =>
   {
     openBedInTree(gardenUid)
-    clearMasterDataSourceSelection()
+    clearBedDataSourceSelection()
     selectBedRecordInDataSource(gardenUid)
 
     if (selectedBedUid === gardenUid)
@@ -735,15 +785,16 @@ const Widget = (props: AllWidgetProps<any>) =>
     setSelectedBedUid('')
   }
 
-  // Finds the master layer inside the selected map widget, then highlights and zooms to the chosen bed.
+  // Find the configured bed layer inside the selected map widget, then
+  // highlight and zoom to the chosen bed.
   const syncMapToGardenBed = async (gardenUid: string) =>
   {
-    if (!jimuMapView || !masterDs || gardenUid === '')
+    if (!jimuMapView || !bedDs || gardenUid === '')
     {
       return
     }
 
-    clearMasterDataSourceSelection()
+    clearBedDataSourceSelection()
     clearMapHighlight()
     clearMapViewSelectionState()
     applyZoneIsolationToMap()
@@ -808,8 +859,7 @@ const Widget = (props: AllWidgetProps<any>) =>
     }
   }
 
-  // Loads the master datasource through DataSourceComponent, then rebuilds the tree from its current records.
-  // Future enhancement: preserve expanded zones/beds across datasource refreshes when matching items still exist.
+  // Expand/collapse helpers for the tree UI.
   const toggleZone = (zone: string) =>
   {
     setExpandedZones((previous) =>
@@ -1097,13 +1147,13 @@ const Widget = (props: AllWidgetProps<any>) =>
     }
 
     void syncMapToGardenBed(selectedBedUid)
-  }, [selectedBedUid, jimuMapView, masterDs])
+  }, [selectedBedUid, jimuMapView, bedDs])
 
   // Applies zone isolate to the connected map only, leaving the tree unchanged.
   useEffect(() =>
   {
     applyZoneIsolationToMap()
-  }, [isolatedZones, selectedBedUid, jimuMapView, masterDs, filteredGardenUidsForSpecies])
+  }, [isolatedZones, selectedBedUid, jimuMapView, bedDs, filteredGardenUidsForSpecies])
 
   // Keeps the active bed visible in the scrollable tree when selection changes.
   useEffect(() =>
@@ -1159,8 +1209,8 @@ const Widget = (props: AllWidgetProps<any>) =>
             resultGardenUid !== '' &&
             (
               resultLayer === targetLayer ||
-              isMasterLayerMatch(resultLayer) ||
-              isMasterLayerMatch(result?.graphic) ||
+              isConfiguredBedLayerMatch(resultLayer) ||
+              isConfiguredBedLayerMatch(result?.graphic) ||
               String(resultLayer?.url || '').toLowerCase() === String(targetLayer?.url || '').toLowerCase() ||
               String(resultLayer?.title || '').toLowerCase() === String(targetLayer?.title || '').toLowerCase()
             )
@@ -1188,7 +1238,7 @@ const Widget = (props: AllWidgetProps<any>) =>
     {
       clearMapClickHandle()
     }
-  }, [jimuMapView, masterDs, zoneGroups, normalizedZoneFilterText])
+  }, [jimuMapView, bedDs, zoneGroups, normalizedZoneFilterText])
 
   // Clears highlight handle when the widget unmounts.
   useEffect(() =>
@@ -1205,7 +1255,7 @@ const Widget = (props: AllWidgetProps<any>) =>
     return (
       <div className="widget-plant-explorer jimu-widget p-3">
         <h3>Plant Explorer</h3>
-        <p>Select the Master data source in widget settings.</p>
+        <p>Select the GardenBeds_Active data source in widget settings.</p>
       </div>
     )
   }
@@ -1225,13 +1275,12 @@ const Widget = (props: AllWidgetProps<any>) =>
         useDataSource={props.useDataSources[0]}
         widgetId={props.id}
         query={{
-          where: MASTER_WHERE,
           outFields: ['*'],
           pageSize: 2000
         }}
         onDataSourceCreated={(dataSource) =>
         {
-          setMasterDs(dataSource)
+          setBedDs(dataSource)
           syncSelectedSpeciesUidFromSession()
           rebuildZoneGroupsFromDataSource(dataSource)
           syncSelectedBedFromDataSource(dataSource)
@@ -1239,17 +1288,17 @@ const Widget = (props: AllWidgetProps<any>) =>
         onDataSourceInfoChange={() =>
         {
           syncSelectedSpeciesUidFromSession()
-          if (masterDs)
+          if (bedDs)
           {
-            rebuildZoneGroupsFromDataSource(masterDs)
-            syncSelectedBedFromDataSource(masterDs)
+            rebuildZoneGroupsFromDataSource(bedDs)
+            syncSelectedBedFromDataSource(bedDs)
           }
         }}
         onSelectionChange={() =>
         {
-          if (masterDs)
+          if (bedDs)
           {
-            syncSelectedBedFromDataSource(masterDs)
+            syncSelectedBedFromDataSource(bedDs)
           }
         }}
         onDataSourceStatusChange={(status) =>
@@ -1258,8 +1307,8 @@ const Widget = (props: AllWidgetProps<any>) =>
         }}
         onCreateDataSourceFailed={(error) =>
         {
-          setLoadError(error?.message || 'Failed to connect to GardenBeds_Master.')
-          setHasLoadedMasterRecords(false)
+          setLoadError(error?.message || 'Failed to connect to GardenBeds_Active.')
+          setHasLoadedBedRecords(false)
           setIsLoadingZones(false)
         }}
       >
@@ -1478,19 +1527,19 @@ const Widget = (props: AllWidgetProps<any>) =>
           <p style={{ color: DANGER_TEXT_COLOR }}>{loadError}</p>
         )}
 
-        {/* The tree below is intentionally driven by the shared master datasource records
+        {/* The tree below is intentionally driven by the shared current-bed datasource
             so it reacts to filters applied by other widgets in the same app. */}
         {!isLoadingZones && loadError === '' && zoneGroups.length === 0 && (
           <div style={EMPTY_STATE_TEXT_STYLE}>
             <p style={{ marginBottom: '0.35rem' }}>
               {selectedSpeciesUid !== ''
                 ? 'No garden beds match the current species filter.'
-                : 'No garden beds are available from the master datasource.'}
+                : 'No garden beds are available from the configured current bed datasource.'}
             </p>
             <p style={EMPTY_STATE_DETAIL_STYLE}>
               {selectedSpeciesUid !== ''
                 ? 'Clear or change the species filter to see more beds.'
-                : hasLoadedMasterRecords
+                : hasLoadedBedRecords
                   ? 'The datasource loaded, but there were no zone or bed records to display.'
                   : 'Check the datasource settings if you expected beds to appear here.'}
             </p>
