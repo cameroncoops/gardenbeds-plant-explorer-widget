@@ -57,6 +57,29 @@ import { SELECTED_SPECIES_UID_KEY } from './lib/service-urls'
 
 const { useEffect, useState } = React
 
+interface TemporalContextValue {
+  viewMode: 'Current' | 'Historical'
+  effectiveDate: string
+  requestToken: number
+  dataState: 'current-ready' | 'historical-pending' | 'historical-ready'
+}
+
+interface HistoricalBedSnapshotRow {
+  gardenUid: string
+  zone: string
+  bedNo: string
+  area?: string
+}
+
+interface HistoricalPlantSnapshotLine {
+  gardenUid: string
+  speciesUid: string
+  costPerUnit: number
+  potSize: string
+  unitType: string
+  currentQuantity: number
+}
+
 // Fallback title/URL fragments used when Experience Builder does not give us a
 // clean datasource id match for the configured current bed layer.
 const CURRENT_BED_LAYER_HINTS = [
@@ -166,7 +189,63 @@ const HELP_POPOVER_STYLE = {
   fontSize: '0.82rem',
   lineHeight: 1.45
 }
-const WIDGET_VERSION = 'v2026.04.20-1'
+const WIDGET_VERSION = 'v2026.04.20-1.5'
+const TEMPORAL_CONTEXT_STORAGE_KEY = 'LIVING_PLACES_TEMPORAL_CONTEXT'
+const TEMPORAL_CONTEXT_EVENT_NAME = 'living-places:temporal-context-changed'
+const HISTORICAL_BED_SNAPSHOT_STORAGE_KEY = 'LIVING_PLACES_HISTORICAL_BED_SNAPSHOT'
+const HISTORICAL_PLANT_SNAPSHOT_STORAGE_KEY = 'LIVING_PLACES_HISTORICAL_PLANT_SNAPSHOT'
+
+const readTemporalContextFromSession = (): TemporalContextValue | null =>
+{
+  try
+  {
+    const rawValue = sessionStorage.getItem(TEMPORAL_CONTEXT_STORAGE_KEY)
+
+    if (!rawValue)
+    {
+      return null
+    }
+
+    const parsedValue = JSON.parse(rawValue)
+
+    if (
+      (parsedValue?.viewMode !== 'Current' && parsedValue?.viewMode !== 'Historical') ||
+      typeof parsedValue?.effectiveDate !== 'string' ||
+      typeof parsedValue?.requestToken !== 'number' ||
+      (parsedValue?.dataState !== 'current-ready' && parsedValue?.dataState !== 'historical-pending' && parsedValue?.dataState !== 'historical-ready')
+    )
+    {
+      return null
+    }
+
+    return parsedValue as TemporalContextValue
+  }
+  catch (error)
+  {
+    console.warn('Failed to parse Living Places temporal context from session storage', error)
+    return null
+  }
+}
+
+const readJsonFromSession = <T,>(storageKey: string): T | null =>
+{
+  try
+  {
+    const rawValue = sessionStorage.getItem(storageKey)
+
+    if (!rawValue)
+    {
+      return null
+    }
+
+    return JSON.parse(rawValue) as T
+  }
+  catch (error)
+  {
+    console.warn(`Failed to parse session storage value for ${storageKey}`, error)
+    return null
+  }
+}
 
 // Shared arrow icon used throughout the hierarchy tree.
 const getTreeToggleIcon = (isExpanded: boolean): string =>
@@ -350,6 +429,7 @@ const getExpandIcon = (isExpanded: boolean): string =>
 
 const Widget = (props: AllWidgetProps<any>) =>
 {
+  const [displayMode, setDisplayMode] = useState<'current' | 'historical'>('current')
   // Shared Experience Builder datasource for the published current bed layer.
   const [bedDs, setBedDs] = useState<DataSource | null>(null)
   const [jimuMapView, setJimuMapView] = useState<JimuMapView | null>(null)
@@ -375,10 +455,13 @@ const Widget = (props: AllWidgetProps<any>) =>
   const [loadingBedPlantLines, setLoadingBedPlantLines] = useState<Record<string, boolean>>({})
   const [expandedSpeciesGroups, setExpandedSpeciesGroups] = useState<string[]>([])
   const [selectedSpeciesUid, setSelectedSpeciesUid] = useState('')
+  const [timelinerContextLabel, setTimelinerContextLabel] = useState('')
+  const [historicalPlantSnapshotLines, setHistoricalPlantSnapshotLines] = useState<HistoricalPlantSnapshotLine[]>([])
 
   const highlightHandleRef = React.useRef<HighlightHandle | null>(null)
   const mapClickHandleRef = React.useRef<ViewEventHandle | null>(null)
   const bedRowRefs = React.useRef<Record<string, HTMLDivElement | null>>({})
+  const latestTemporalRequestTokenRef = React.useRef<number>(0)
   const normalizedZoneFilterText = normalizeFilterValue(zoneFilterText)
 
   // Reads the currently selected species from session storage so the widget can
@@ -526,6 +609,82 @@ const Widget = (props: AllWidgetProps<any>) =>
       return next
     })
     setSelectedBedUid((previous) => availableBeds.has(previous) ? previous : '')
+  }
+
+  const applyHistoricalSnapshotToView = (
+    historicalBeds: HistoricalBedSnapshotRow[],
+    historicalPlantLines: HistoricalPlantSnapshotLine[],
+    effectiveDate: string
+  ) =>
+  {
+    const zoneMap = new Map<string, BedItem[]>()
+    const plantLinesByBedUid = new Map<string, HistoricalPlantSnapshotLine[]>()
+
+    historicalBeds.forEach((bed) =>
+    {
+      if (!zoneMap.has(bed.zone))
+      {
+        zoneMap.set(bed.zone, [])
+      }
+
+      zoneMap.get(bed.zone)?.push({
+        gardenUid: bed.gardenUid,
+        bedNo: bed.bedNo,
+        area: String(bed.area || '')
+      })
+    })
+
+    historicalPlantLines.forEach((plantLine) =>
+    {
+      if (!plantLinesByBedUid.has(plantLine.gardenUid))
+      {
+        plantLinesByBedUid.set(plantLine.gardenUid, [])
+      }
+
+      plantLinesByBedUid.get(plantLine.gardenUid)?.push(plantLine)
+    })
+
+    const nextZoneGroups = Array.from(zoneMap.entries())
+      .map(([zone, beds]) =>
+      {
+        return {
+          zone,
+          beds: beds.slice().sort((left, right) =>
+          {
+            return left.bedNo.localeCompare(right.bedNo, undefined, { numeric: true, sensitivity: 'base' })
+          })
+        }
+      })
+      .sort((left, right) =>
+      {
+        return compareZoneValues(left.zone, right.zone)
+      })
+
+    const historicalBedPlantTotals: Record<string, number> = {}
+
+    historicalBeds.forEach((bed) =>
+    {
+      historicalBedPlantTotals[bed.gardenUid] = (plantLinesByBedUid.get(bed.gardenUid) || []).reduce((sum, line) =>
+      {
+        return sum + line.currentQuantity
+      }, 0)
+    })
+
+    setDisplayMode('historical')
+    setHasLoadedBedRecords(historicalBeds.length > 0)
+    setIsLoadingZones(false)
+    setLoadError('')
+    setZoneGroups(nextZoneGroups)
+    setExpandedZones([])
+    setExpandedBeds([])
+    setExpandedPlantTotals([])
+    setExpandedSpeciesGroups([])
+    setBedPlantTotals(historicalBedPlantTotals)
+    setLoadingBedTotals({})
+    setBedPlantLines({})
+    setLoadingBedPlantLines({})
+    setHistoricalPlantSnapshotLines(historicalPlantLines)
+    setTimelinerContextLabel(`Controlled by Timeliner: Historical as at ${effectiveDate}`)
   }
 
   // Removes the current map highlight when the selected bed changes or the widget unmounts.
@@ -781,8 +940,20 @@ const Widget = (props: AllWidgetProps<any>) =>
   const clearSelectedBed = () =>
   {
     clearMapHighlight()
+    clearBedDataSourceSelection()
     clearMapViewSelectionState()
     setSelectedBedUid('')
+  }
+
+  const resetViewStateForTemporalApply = () =>
+  {
+    clearSelectedBed()
+    setZoneFilterText('')
+    setIsolatedZones([])
+    setExpandedZones([])
+    setExpandedBeds([])
+    setExpandedPlantTotals([])
+    setExpandedSpeciesGroups([])
   }
 
   // Find the configured bed layer inside the selected map widget, then
@@ -972,6 +1143,82 @@ const Widget = (props: AllWidgetProps<any>) =>
 
   useEffect(() =>
   {
+    const applyTemporalContext = (temporalContext: TemporalContextValue | null) =>
+    {
+      if (!temporalContext || temporalContext.requestToken <= latestTemporalRequestTokenRef.current)
+      {
+        return
+      }
+
+      latestTemporalRequestTokenRef.current = temporalContext.requestToken
+
+      if (temporalContext.viewMode === 'Current' && temporalContext.dataState === 'current-ready')
+      {
+        resetViewStateForTemporalApply()
+        setDisplayMode('current')
+        setBedPlantTotals({})
+        setLoadingBedTotals({})
+        setBedPlantLines({})
+        setLoadingBedPlantLines({})
+        setHistoricalPlantSnapshotLines([])
+
+        if (bedDs)
+        {
+          rebuildZoneGroupsFromDataSource(bedDs)
+        }
+
+        setTimelinerContextLabel('Controlled by Timeliner: Current')
+        return
+      }
+
+      if (temporalContext.viewMode === 'Historical' && temporalContext.dataState === 'historical-ready')
+      {
+        const historicalBedSnapshot = readJsonFromSession<{ activeBeds: HistoricalBedSnapshotRow[] }>(HISTORICAL_BED_SNAPSHOT_STORAGE_KEY)
+        const historicalPlantSnapshot = readJsonFromSession<{ plantLines: HistoricalPlantSnapshotLine[] }>(HISTORICAL_PLANT_SNAPSHOT_STORAGE_KEY)
+
+        if (!historicalBedSnapshot || !historicalPlantSnapshot)
+        {
+          setTimelinerContextLabel('Timeliner historical snapshot is missing from session storage.')
+          return
+        }
+
+        resetViewStateForTemporalApply()
+        applyHistoricalSnapshotToView(
+          historicalBedSnapshot.activeBeds || [],
+          historicalPlantSnapshot.plantLines || [],
+          temporalContext.effectiveDate
+        )
+        return
+      }
+
+      if (temporalContext.viewMode === 'Historical' && temporalContext.dataState === 'historical-pending')
+      {
+        setTimelinerContextLabel('')
+      }
+    }
+
+    const handleTemporalContextChanged = (event: Event) =>
+    {
+      const customEvent = event as CustomEvent<TemporalContextValue>
+      applyTemporalContext(customEvent.detail || null)
+    }
+
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function')
+    {
+      window.addEventListener(TEMPORAL_CONTEXT_EVENT_NAME, handleTemporalContextChanged as EventListener)
+    }
+
+    return () =>
+    {
+      if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function')
+      {
+        window.removeEventListener(TEMPORAL_CONTEXT_EVENT_NAME, handleTemporalContextChanged as EventListener)
+      }
+    }
+  }, [bedDs])
+
+  useEffect(() =>
+  {
     const loadSpeciesOptions = async () =>
     {
       setIsLoadingSpeciesOptions(true)
@@ -1010,6 +1257,19 @@ const Widget = (props: AllWidgetProps<any>) =>
 
       setIsLoadingSpeciesBeds(true)
 
+      if (displayMode === 'historical')
+      {
+        const matchingGardenUids = Array.from(new Set(
+          historicalPlantSnapshotLines
+            .filter((line) => line.speciesUid === selectedSpeciesUid)
+            .map((line) => line.gardenUid)
+        ))
+
+        setFilteredGardenUidsForSpecies(matchingGardenUids)
+        setIsLoadingSpeciesBeds(false)
+        return
+      }
+
       try
       {
         const matchingGardenUids = await queryGardenUidsForSpecies(selectedSpeciesUid)
@@ -1034,7 +1294,7 @@ const Widget = (props: AllWidgetProps<any>) =>
     }
 
     void syncSpeciesFilter()
-  }, [selectedSpeciesUid])
+  }, [selectedSpeciesUid, displayMode, historicalPlantSnapshotLines])
 
   useEffect(() =>
   {
@@ -1046,8 +1306,13 @@ const Widget = (props: AllWidgetProps<any>) =>
 
   useEffect(() =>
   {
-    const loadExpandedBedTotals = async () =>
-    {
+      const loadExpandedBedTotals = async () =>
+      {
+      if (displayMode === 'historical')
+      {
+        return
+      }
+
       const bedUidsToLoad = expandedBeds.filter((gardenUid) =>
       {
         return bedPlantTotals[gardenUid] === undefined && !loadingBedTotals[gardenUid]
@@ -1088,13 +1353,56 @@ const Widget = (props: AllWidgetProps<any>) =>
     }
 
     void loadExpandedBedTotals()
-  }, [expandedBeds, bedPlantTotals, loadingBedTotals])
+  }, [expandedBeds, bedPlantTotals, loadingBedTotals, displayMode])
 
   // Loads detailed plant lines only for beds whose "Total Plants" section is expanded.
   useEffect(() =>
   {
-    const loadExpandedPlantLines = async () =>
-    {
+      const loadExpandedPlantLines = async () =>
+      {
+      if (displayMode === 'historical')
+      {
+        const speciesNameByUid = new Map<string, string>(
+          speciesOptions.map((speciesOption) => [speciesOption.speciesUid, speciesOption.speciesName])
+        )
+
+        const bedUidsToLoad = expandedPlantTotals.filter((gardenUid) =>
+        {
+          return bedPlantLines[gardenUid] === undefined
+        })
+
+        if (bedUidsToLoad.length === 0)
+        {
+          return
+        }
+
+        bedUidsToLoad.forEach((gardenUid) =>
+        {
+          const matchingLines = historicalPlantSnapshotLines
+            .filter((line) => line.gardenUid === gardenUid)
+            .map((line) =>
+            {
+              const speciesName = speciesNameByUid.get(line.speciesUid) || line.speciesUid
+
+              return {
+                speciesUid: line.speciesUid,
+                speciesName,
+                quantity: line.currentQuantity,
+                costPerUnit: line.costPerUnit,
+                unitType: line.unitType,
+                usedSpeciesUidFallback: speciesName === line.speciesUid
+              }
+            })
+
+          setBedPlantLines((previous) => ({
+            ...previous,
+            [gardenUid]: matchingLines
+          }))
+        })
+
+        return
+      }
+
       const bedUidsToLoad = expandedPlantTotals.filter((gardenUid) =>
       {
         return bedPlantLines[gardenUid] === undefined && !loadingBedPlantLines[gardenUid]
@@ -1135,7 +1443,50 @@ const Widget = (props: AllWidgetProps<any>) =>
     }
 
     void loadExpandedPlantLines()
-  }, [expandedPlantTotals, bedPlantLines, loadingBedPlantLines])
+  }, [expandedPlantTotals, bedPlantLines, loadingBedPlantLines, displayMode, historicalPlantSnapshotLines, speciesOptions])
+
+  const getHistoricalDisplayPlantLines = (gardenUid: string) =>
+  {
+    const speciesNameByUid = new Map<string, string>(
+      speciesOptions.map((speciesOption) => [speciesOption.speciesUid, speciesOption.speciesName])
+    )
+
+    return historicalPlantSnapshotLines
+      .filter((line) => line.gardenUid === gardenUid)
+      .map((line) =>
+      {
+        const speciesName = speciesNameByUid.get(line.speciesUid) || line.speciesUid
+
+        return {
+          speciesUid: line.speciesUid,
+          speciesName,
+          quantity: line.currentQuantity,
+          costPerUnit: line.costPerUnit,
+          unitType: line.unitType,
+          usedSpeciesUidFallback: speciesName === line.speciesUid
+        }
+      })
+  }
+
+  const getDisplayPlantLines = (gardenUid: string) =>
+  {
+    if (displayMode === 'historical')
+    {
+      return getHistoricalDisplayPlantLines(gardenUid)
+    }
+
+    return bedPlantLines[gardenUid] || []
+  }
+
+  const getDisplayPlantTotal = (gardenUid: string) =>
+  {
+    if (displayMode === 'historical')
+    {
+      return getHistoricalDisplayPlantLines(gardenUid).reduce((sum, line) => sum + line.quantity, 0)
+    }
+
+    return bedPlantTotals[gardenUid] ?? 0
+  }
 
   // Keeps map highlight in sync with the currently selected bed.
   useEffect(() =>
@@ -1282,13 +1633,16 @@ const Widget = (props: AllWidgetProps<any>) =>
         {
           setBedDs(dataSource)
           syncSelectedSpeciesUidFromSession()
-          rebuildZoneGroupsFromDataSource(dataSource)
-          syncSelectedBedFromDataSource(dataSource)
+          if (displayMode === 'current')
+          {
+            rebuildZoneGroupsFromDataSource(dataSource)
+            syncSelectedBedFromDataSource(dataSource)
+          }
         }}
         onDataSourceInfoChange={() =>
         {
           syncSelectedSpeciesUidFromSession()
-          if (bedDs)
+          if (displayMode === 'current' && bedDs)
           {
             rebuildZoneGroupsFromDataSource(bedDs)
             syncSelectedBedFromDataSource(bedDs)
@@ -1296,7 +1650,7 @@ const Widget = (props: AllWidgetProps<any>) =>
         }}
         onSelectionChange={() =>
         {
-          if (bedDs)
+          if (displayMode === 'current' && bedDs)
           {
             syncSelectedBedFromDataSource(bedDs)
           }
@@ -1336,6 +1690,11 @@ const Widget = (props: AllWidgetProps<any>) =>
             <h3 style={{ margin: 0, fontSize: '1.1rem', fontWeight: 700 }}>Plant Explorer</h3>
             <span style={{ fontSize: '0.78rem', color: SECONDARY_TEXT_COLOR }}>{WIDGET_VERSION}</span>
           </div>
+          {timelinerContextLabel !== '' && (
+            <div style={{ marginTop: '0.3rem', fontSize: '0.8rem', color: SECONDARY_TEXT_COLOR }}>
+              {timelinerContextLabel}
+            </div>
+          )}
         </div>
 
       </div>
@@ -1621,7 +1980,11 @@ const Widget = (props: AllWidgetProps<any>) =>
 
                   {expandedZones.includes(zoneGroup.zone) && (
                     <div className="mb-0 mt-1" style={{ marginLeft: '5.9rem' }}>
-                      {zoneGroup.beds.map((bed) => (
+                      {zoneGroup.beds.map((bed) =>
+                      {
+                        const displayPlantLines = getDisplayPlantLines(bed.gardenUid)
+
+                        return (
                         <div
                           key={bed.gardenUid}
                           ref={(element) =>
@@ -1687,13 +2050,13 @@ const Widget = (props: AllWidgetProps<any>) =>
                                   {getTreeToggleIcon(expandedPlantTotals.includes(bed.gardenUid))}
                                 </button>
                                 {' '}
-                                Total Plants: {loadingBedTotals[bed.gardenUid]
+                                Total Plants: {displayMode !== 'historical' && loadingBedTotals[bed.gardenUid]
                                   ? 'Loading...'
-                                  : (bedPlantTotals[bed.gardenUid] ?? 0).toLocaleString()}
+                                  : getDisplayPlantTotal(bed.gardenUid).toLocaleString()}
                               </div>
                               {expandedPlantTotals.includes(bed.gardenUid) && (
                                 <div style={{ marginLeft: '1.35rem', marginTop: '0.15rem' }}>
-                                  {!loadingBedPlantLines[bed.gardenUid] && (bedPlantLines[bed.gardenUid] || []).some((plantLine) => plantLine.usedSpeciesUidFallback) && (
+                                  {!(displayMode !== 'historical' && loadingBedPlantLines[bed.gardenUid]) && displayPlantLines.some((plantLine) => plantLine.usedSpeciesUidFallback) && (
                                     <div
                                       style={{
                                         marginBottom: '0.45rem',
@@ -1712,7 +2075,7 @@ const Widget = (props: AllWidgetProps<any>) =>
                                       <div style={{ marginTop: '0.3rem', wordBreak: 'break-all' }}>
                                         Unresolved `species_uid` values:
                                         {' '}
-                                        {Array.from(new Set((bedPlantLines[bed.gardenUid] || [])
+                                        {Array.from(new Set(displayPlantLines
                                           .filter((plantLine) => plantLine.usedSpeciesUidFallback)
                                           .map((plantLine) => plantLine.speciesUid)))
                                           .join(', ')}
@@ -1722,15 +2085,15 @@ const Widget = (props: AllWidgetProps<any>) =>
                                       </div>
                                     </div>
                                   )}
-                                  {loadingBedPlantLines[bed.gardenUid] && (
+                                  {displayMode !== 'historical' && loadingBedPlantLines[bed.gardenUid] && (
                                     <div style={{ color: MUTED_TEXT_COLOR }}>Loading plant lines...</div>
                                   )}
-                                  {!loadingBedPlantLines[bed.gardenUid] && (bedPlantLines[bed.gardenUid] || []).length === 0 && (
+                                  {!(displayMode !== 'historical' && loadingBedPlantLines[bed.gardenUid]) && displayPlantLines.length === 0 && (
                                     <div style={{ color: MUTED_TEXT_COLOR }}>No plant lines found.</div>
                                   )}
-                                  {!loadingBedPlantLines[bed.gardenUid] && (bedPlantLines[bed.gardenUid] || []).length > 0 && (
+                                  {!(displayMode !== 'historical' && loadingBedPlantLines[bed.gardenUid]) && displayPlantLines.length > 0 && (
                                     <div>
-                                      {groupPlantLinesBySpecies(bedPlantLines[bed.gardenUid] || []).map((speciesGroup) =>
+                                      {groupPlantLinesBySpecies(displayPlantLines).map((speciesGroup) =>
                                       {
                                         const speciesGroupKey = `${bed.gardenUid}|||${speciesGroup.speciesUid}|||${speciesGroup.speciesName}`
                                         const isExpanded = expandedSpeciesGroups.includes(speciesGroupKey)
@@ -1790,7 +2153,8 @@ const Widget = (props: AllWidgetProps<any>) =>
                             </div>
                           )}
                         </div>
-                      ))}
+                        )
+                      })}
                     </div>
                   )}
                 </div>
