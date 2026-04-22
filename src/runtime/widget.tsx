@@ -53,7 +53,7 @@ import FeatureFilter from 'esri/layers/support/FeatureFilter'
 import { buildSqlInClause, firstValue, getGardenUidFromRecord, escapeSqlValue } from './lib/field-helpers'
 import { queryGardenUidsForSpecies, queryPlantLinesForBed, queryPlantsInBedTotal, querySpeciesOptions } from './lib/plant-queries'
 import type { PlantLine, SpeciesOption } from './lib/plant-types'
-import { SELECTED_SPECIES_UID_KEY } from './lib/service-urls'
+import { PLANT_DATA_REFRESH_EVENT_NAME, SELECTED_SPECIES_UID_KEY } from './lib/service-urls'
 
 const { useEffect, useState } = React
 
@@ -125,8 +125,8 @@ const EMPTY_STATE_DETAIL_STYLE = {
 }
 const SECTION_LABEL_STYLE = {
   display: 'grid',
-  gridTemplateColumns: '4.75rem 1fr',
-  columnGap: '0.5rem',
+  gridTemplateColumns: '2.6rem 1fr',
+  columnGap: '0.95rem',
   alignItems: 'center',
   marginBottom: '0.5rem',
   paddingBottom: '0.35rem',
@@ -140,20 +140,20 @@ const CHECKBOX_STYLE = {
 }
 const ZONE_ROW_STYLE = {
   display: 'grid',
-  gridTemplateColumns: '4.75rem 1fr',
-  columnGap: '0.5rem',
+  gridTemplateColumns: '2.6rem 1fr',
+  columnGap: '0.95rem',
   alignItems: 'start'
 }
 const ZONE_ISOLATE_HEADER_STYLE = {
-  fontSize: '0.72rem',
-  letterSpacing: '0.05em',
+  fontSize: '0.6rem',
+  letterSpacing: '0.06em',
   textTransform: 'uppercase' as const,
-  color: SECONDARY_TEXT_COLOR,
+  color: '#4d4d4d',
   fontWeight: 700,
   textAlign: 'center' as const
 }
 const SECTION_TITLE_STYLE = {
-  fontSize: '0.88rem',
+  fontSize: '0.8rem',
   letterSpacing: '0.06em',
   textTransform: 'uppercase' as const,
   color: '#4d4d4d',
@@ -174,6 +174,17 @@ const HELP_BUTTON_STYLE = {
   justifyContent: 'center',
   cursor: 'pointer'
 }
+const ICON_BUTTON_STYLE = {
+  ...PLAIN_BUTTON_STYLE,
+  width: '1.25rem',
+  height: '1.25rem',
+  color: ACCENT_COLOR,
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  cursor: 'pointer',
+  padding: 0
+}
 const HELP_POPOVER_STYLE = {
   position: 'absolute' as const,
   top: '1.7rem',
@@ -189,7 +200,7 @@ const HELP_POPOVER_STYLE = {
   fontSize: '0.82rem',
   lineHeight: 1.45
 }
-const WIDGET_VERSION = 'v2026.04.20-1.10'
+const WIDGET_VERSION = 'v2026.04.20-1.16'
 const TEMPORAL_CONTEXT_STORAGE_KEY = 'LIVING_PLACES_TEMPORAL_CONTEXT'
 const TEMPORAL_CONTEXT_EVENT_NAME = 'living-places:temporal-context-changed'
 const HISTORICAL_BED_SNAPSHOT_STORAGE_KEY = 'LIVING_PLACES_HISTORICAL_BED_SNAPSHOT'
@@ -457,6 +468,7 @@ const Widget = (props: AllWidgetProps<any>) =>
   const [selectedSpeciesUid, setSelectedSpeciesUid] = useState('')
   const [timelinerContextLabel, setTimelinerContextLabel] = useState('')
   const [historicalPlantSnapshotLines, setHistoricalPlantSnapshotLines] = useState<HistoricalPlantSnapshotLine[]>([])
+  const [refreshNonce, setRefreshNonce] = useState(0)
 
   const highlightHandleRef = React.useRef<HighlightHandle | null>(null)
   const mapClickHandleRef = React.useRef<ViewEventHandle | null>(null)
@@ -1059,6 +1071,75 @@ const Widget = (props: AllWidgetProps<any>) =>
     setExpandedSpeciesGroups([])
   }
 
+  const refreshCurrentView = async () =>
+  {
+    if (displayModeRef.current !== 'current')
+    {
+      return
+    }
+
+    if (bedDs && typeof (bedDs as any).load === 'function')
+    {
+      try
+      {
+        await (bedDs as any).load()
+      }
+      catch (error)
+      {
+        console.warn('Failed to reload the current bed datasource for Plant Explorer', error)
+      }
+    }
+
+    if (bedDs)
+    {
+      rebuildZoneGroupsFromDataSource(bedDs)
+      syncSelectedBedFromDataSource(bedDs)
+    }
+
+    setBedPlantTotals({})
+    setLoadingBedTotals({})
+    setBedPlantLines({})
+    setLoadingBedPlantLines({})
+    setRefreshNonce((previous) => previous + 1)
+  }
+
+  const refreshHistoricalView = () =>
+  {
+    const temporalContext = readTemporalContextFromSession()
+
+    if (!temporalContext || temporalContext.viewMode !== 'Historical' || temporalContext.dataState !== 'historical-ready')
+    {
+      return
+    }
+
+    const historicalBedSnapshot = readJsonFromSession<{ activeBeds: HistoricalBedSnapshotRow[] }>(HISTORICAL_BED_SNAPSHOT_STORAGE_KEY)
+    const historicalPlantSnapshot = readJsonFromSession<{ plantLines: HistoricalPlantSnapshotLine[] }>(HISTORICAL_PLANT_SNAPSHOT_STORAGE_KEY)
+
+    if (!historicalBedSnapshot || !historicalPlantSnapshot)
+    {
+      setTimelinerContextLabel('Timeliner historical snapshot is missing from session storage.')
+      return
+    }
+
+    resetViewStateForTemporalApply()
+    applyHistoricalSnapshotToView(
+      historicalBedSnapshot.activeBeds || [],
+      historicalPlantSnapshot.plantLines || [],
+      temporalContext.effectiveDate
+    )
+  }
+
+  const handleManualRefresh = () =>
+  {
+    if (displayModeRef.current === 'historical')
+    {
+      refreshHistoricalView()
+      return
+    }
+
+    void refreshCurrentView()
+  }
+
   // Find the configured bed layer inside the selected map widget, then
   // highlight and zoom to the chosen bed.
   const syncMapToGardenBed = async (gardenUid: string) =>
@@ -1264,7 +1345,7 @@ const Widget = (props: AllWidgetProps<any>) =>
   useEffect(() =>
   {
     syncSelectedSpeciesUidFromSession()
-  }, [])
+  }, [refreshNonce])
 
   useEffect(() =>
   {
@@ -1420,7 +1501,31 @@ const Widget = (props: AllWidgetProps<any>) =>
     }
 
     void syncSpeciesFilter()
-  }, [selectedSpeciesUid, displayMode, historicalPlantSnapshotLines])
+  }, [selectedSpeciesUid, displayMode, historicalPlantSnapshotLines, refreshNonce])
+
+  useEffect(() =>
+  {
+    const handlePlantDataRefresh = () =>
+    {
+      if (displayModeRef.current === 'current')
+      {
+        void refreshCurrentView()
+      }
+    }
+
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function')
+    {
+      window.addEventListener(PLANT_DATA_REFRESH_EVENT_NAME, handlePlantDataRefresh as EventListener)
+    }
+
+    return () =>
+    {
+      if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function')
+      {
+        window.removeEventListener(PLANT_DATA_REFRESH_EVENT_NAME, handlePlantDataRefresh as EventListener)
+      }
+    }
+  }, [bedDs, selectedSpeciesUid])
 
   useEffect(() =>
   {
@@ -2076,6 +2181,23 @@ const Widget = (props: AllWidgetProps<any>) =>
                 >
                   ?
                 </button>
+                <button
+                  type="button"
+                  className="btn btn-link p-0"
+                  style={ICON_BUTTON_STYLE}
+                  aria-label="Refresh"
+                  onClick={handleManualRefresh}
+                  title="Refresh"
+                >
+                  <svg
+                    viewBox="0 0 32 32"
+                    aria-hidden="true"
+                    style={{ width: '1.05rem', height: '1.05rem', fill: 'currentColor', display: 'block', overflow: 'visible' }}
+                  >
+                    <path d="M27.765,15c-1.166,0-1.846-0.575-2.076-1.475C24.585,9.204,20.66,6,16,6c-2.684,0-5.201,1.082-7.059,2.941l2.847,2.847 C12.235,12.235,11.918,13,11.286,13H2V3.714c0-0.633,0.765-0.949,1.212-0.502l2.905,2.905C8.718,3.515,12.242,2,16,2 c6.582,0,12.105,4.568,13.591,10.699C29.876,13.871,28.971,15,27.765,15z" />
+                    <path d="M30,19v9.286c0,0.633-0.765,0.949-1.212,0.502l-2.905-2.905C23.282,28.485,19.758,30,16,30 C9.418,30,3.895,25.432,2.409,19.301C2.124,18.129,3.029,17,4.235,17c1.166,0,1.846,0.575,2.076,1.475C7.415,22.796,11.34,26,16,26 c2.684,0,5.201-1.082,7.059-2.941l-2.847-2.847C19.765,19.765,20.082,19,20.714,19H30z" />
+                  </svg>
+                </button>
                 {showHelp && (
                   <div style={HELP_POPOVER_STYLE}>
                     <div style={{ fontWeight: 700, marginBottom: '0.35rem' }}>How this works</div>
@@ -2123,7 +2245,7 @@ const Widget = (props: AllWidgetProps<any>) =>
                   </div>
 
                   {expandedZones.includes(zoneGroup.zone) && (
-                    <div className="mb-0 mt-1" style={{ marginLeft: '5.9rem' }}>
+                    <div className="mb-0 mt-1" style={{ marginLeft: '3.7rem' }}>
                       {zoneGroup.beds.map((bed) =>
                       {
                         const displayPlantLines = getDisplayPlantLines(bed.gardenUid)
