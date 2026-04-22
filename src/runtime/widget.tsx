@@ -189,7 +189,7 @@ const HELP_POPOVER_STYLE = {
   fontSize: '0.82rem',
   lineHeight: 1.45
 }
-const WIDGET_VERSION = 'v2026.04.20-1.5'
+const WIDGET_VERSION = 'v2026.04.20-1.10'
 const TEMPORAL_CONTEXT_STORAGE_KEY = 'LIVING_PLACES_TEMPORAL_CONTEXT'
 const TEMPORAL_CONTEXT_EVENT_NAME = 'living-places:temporal-context-changed'
 const HISTORICAL_BED_SNAPSHOT_STORAGE_KEY = 'LIVING_PLACES_HISTORICAL_BED_SNAPSHOT'
@@ -462,6 +462,8 @@ const Widget = (props: AllWidgetProps<any>) =>
   const mapClickHandleRef = React.useRef<ViewEventHandle | null>(null)
   const bedRowRefs = React.useRef<Record<string, HTMLDivElement | null>>({})
   const latestTemporalRequestTokenRef = React.useRef<number>(0)
+  const displayModeRef = React.useRef<'current' | 'historical'>('current')
+  const visibleGardenUidsRef = React.useRef<Set<string>>(new Set())
   const normalizedZoneFilterText = normalizeFilterValue(zoneFilterText)
 
   // Reads the currently selected species from session storage so the widget can
@@ -670,6 +672,7 @@ const Widget = (props: AllWidgetProps<any>) =>
       }, 0)
     })
 
+    displayModeRef.current = 'historical'
     setDisplayMode('historical')
     setHasLoadedBedRecords(historicalBeds.length > 0)
     setIsLoadingZones(false)
@@ -766,6 +769,106 @@ const Widget = (props: AllWidgetProps<any>) =>
     const layerViewEntries = Object.values((jimuMapView as any).jimuLayerViews || {})
 
     return layerViewEntries.find((entry: any) => isConfiguredBedLayerMatch(entry, dataSourceId)) || null
+  }
+
+  const findHistoricalMapLayerForGardenBed = async (gardenUid: string) =>
+  {
+    const jsApiMapView = jimuMapView?.view as any
+    const configuredCurrentLayer = findMatchingJimuLayerView()?.layer as any
+    const configuredCurrentLayerUrl = String(configuredCurrentLayer?.url || '').trim().toLowerCase()
+    const allLayers = jsApiMapView?.map?.allLayers?.toArray ? jsApiMapView.map.allLayers.toArray() : []
+
+    for (const layer of allLayers)
+    {
+      if (!layer || layer === configuredCurrentLayer || layer.visible !== true || String(layer?.type || '').toLowerCase() !== 'feature')
+      {
+        continue
+      }
+
+      const layerUrl = String(layer?.url || '').trim().toLowerCase()
+
+      if (configuredCurrentLayerUrl !== '' && layerUrl === configuredCurrentLayerUrl)
+      {
+        continue
+      }
+
+      const layerFields = Array.isArray(layer.fields) ? layer.fields : []
+      const gardenUidField =
+        layerFields.find((field: any) => String(field?.name || '').toLowerCase() === 'garden_uid')?.name ||
+        layerFields.find((field: any) => String(field?.name || '').toLowerCase().endsWith('.garden_uid'))?.name ||
+        null
+
+      if (!gardenUidField)
+      {
+        continue
+      }
+
+      const query = layer.createQuery()
+      query.where = `${gardenUidField} = '${escapeSqlValue(gardenUid)}'`
+      query.outFields = ['*']
+      query.returnGeometry = true
+
+      const featureSet = await layer.queryFeatures(query)
+      const features = featureSet?.features || []
+
+      if (features.length > 0)
+      {
+        const layerView = typeof jsApiMapView?.whenLayerView === 'function'
+          ? await jsApiMapView.whenLayerView(layer)
+          : null
+
+        return {
+          layer,
+          layerView,
+          features
+        }
+      }
+    }
+
+    return null
+  }
+
+  const resolveGardenUidFromHitResult = async (result: any): Promise<string> =>
+  {
+    const resultAttributes = result?.graphic?.attributes || {}
+    const directGardenUid = firstValue(resultAttributes, ['garden_uid', 'GARDEN_UID'])
+
+    if (directGardenUid !== '')
+    {
+      return directGardenUid
+    }
+
+    const resultLayer = result?.graphic?.layer
+    const objectIdField = String(resultLayer?.objectIdField || '').trim()
+    const objectIdValue = objectIdField !== '' ? resultAttributes?.[objectIdField] : null
+    const layerFields = Array.isArray(resultLayer?.fields) ? resultLayer.fields : []
+    const gardenUidField =
+      layerFields.find((field: any) => String(field?.name || '').toLowerCase() === 'garden_uid')?.name ||
+      layerFields.find((field: any) => String(field?.name || '').toLowerCase().endsWith('.garden_uid'))?.name ||
+      null
+
+    if (!resultLayer || typeof resultLayer.createQuery !== 'function' || typeof resultLayer.queryFeatures !== 'function' || !gardenUidField || objectIdField === '' || objectIdValue === null || objectIdValue === undefined)
+    {
+      return ''
+    }
+
+    try
+    {
+      const query = resultLayer.createQuery()
+      query.where = `${objectIdField} = ${Number(objectIdValue)}`
+      query.outFields = [gardenUidField]
+      query.returnGeometry = false
+
+      const featureSet = await resultLayer.queryFeatures(query)
+      const featureAttributes = featureSet?.features?.[0]?.attributes || {}
+
+      return firstValue(featureAttributes, [gardenUidField, 'garden_uid', 'GARDEN_UID'])
+    }
+    catch (error)
+    {
+      console.warn('Failed to resolve garden_uid from clicked map feature', error)
+      return ''
+    }
   }
 
   const applyZoneIsolationToMap = () =>
@@ -972,39 +1075,56 @@ const Widget = (props: AllWidgetProps<any>) =>
 
     try
     {
-      const matchingJimuLayerView = findMatchingJimuLayerView()
-
       const jsApiMapView = jimuMapView.view
-      const jsApiLayerView = matchingJimuLayerView?.view
-      const jsApiLayer = matchingJimuLayerView?.layer || jsApiLayerView?.layer
+      let jsApiLayerView: any = null
+      let jsApiLayer: any = null
+      let features: any[] = []
+
+      if (displayModeRef.current === 'historical')
+      {
+        const historicalMatch = await findHistoricalMapLayerForGardenBed(gardenUid)
+
+        jsApiLayerView = historicalMatch?.layerView
+        jsApiLayer = historicalMatch?.layer || jsApiLayerView?.layer
+        features = historicalMatch?.features || []
+      }
+      else
+      {
+        const matchingJimuLayerView = findMatchingJimuLayerView()
+        jsApiLayerView = matchingJimuLayerView?.view
+        jsApiLayer = matchingJimuLayerView?.layer || jsApiLayerView?.layer
+      }
 
       if (!jsApiMapView || !jsApiLayerView || !jsApiLayer)
       {
         return
       }
 
-      const layerFields = Array.isArray(jsApiLayer.fields) ? jsApiLayer.fields : []
-      const gardenUidField =
-        layerFields.find((field: any) => String(field?.name || '').toLowerCase() === 'garden_uid')?.name ||
-        layerFields.find((field: any) => String(field?.name || '').toLowerCase().endsWith('.garden_uid'))?.name ||
-        null
-
-      if (!gardenUidField)
-      {
-        return
-      }
-
-      const query = jsApiLayer.createQuery()
-      query.where = `${gardenUidField} = '${escapeSqlValue(gardenUid)}'`
-      query.outFields = ['*']
-      query.returnGeometry = true
-
-      const featureSet = await jsApiLayer.queryFeatures(query)
-      const features = featureSet?.features || []
-
       if (features.length === 0)
       {
-        return
+        const layerFields = Array.isArray(jsApiLayer.fields) ? jsApiLayer.fields : []
+        const gardenUidField =
+          layerFields.find((field: any) => String(field?.name || '').toLowerCase() === 'garden_uid')?.name ||
+          layerFields.find((field: any) => String(field?.name || '').toLowerCase().endsWith('.garden_uid'))?.name ||
+          null
+
+        if (!gardenUidField)
+        {
+          return
+        }
+
+        const query = jsApiLayer.createQuery()
+        query.where = `${gardenUidField} = '${escapeSqlValue(gardenUid)}'`
+        query.outFields = ['*']
+        query.returnGeometry = true
+
+        const featureSet = await jsApiLayer.queryFeatures(query)
+        features = featureSet?.features || []
+
+        if (features.length === 0)
+        {
+          return
+        }
       }
 
       if (typeof jsApiLayerView.highlight === 'function')
@@ -1135,6 +1255,11 @@ const Widget = (props: AllWidgetProps<any>) =>
         (normalizedZoneFilterText === '' || normalizeFilterValue(zoneGroup.zone).includes(normalizedZoneFilterText))
     })
 
+  useEffect(() =>
+  {
+    visibleGardenUidsRef.current = new Set(zoneGroups.flatMap((zoneGroup) => zoneGroup.beds.map((bed) => bed.gardenUid)))
+  }, [zoneGroups])
+
   // Loads bed-level plant totals only for beds that are currently expanded.
   useEffect(() =>
   {
@@ -1155,6 +1280,7 @@ const Widget = (props: AllWidgetProps<any>) =>
       if (temporalContext.viewMode === 'Current' && temporalContext.dataState === 'current-ready')
       {
         resetViewStateForTemporalApply()
+        displayModeRef.current = 'current'
         setDisplayMode('current')
         setBedPlantTotals({})
         setLoadingBedTotals({})
@@ -1534,7 +1660,7 @@ const Widget = (props: AllWidgetProps<any>) =>
     const matchingJimuLayerView = findMatchingJimuLayerView()
     const targetLayer = matchingJimuLayerView?.layer || matchingJimuLayerView?.view?.layer
 
-    if (!jsApiMapView || !targetLayer || typeof jsApiMapView.on !== 'function')
+    if (!jsApiMapView || typeof jsApiMapView.on !== 'function')
     {
       return
     }
@@ -1550,26 +1676,44 @@ const Widget = (props: AllWidgetProps<any>) =>
 
         const hitTestResult = await jsApiMapView.hitTest(event)
         const results = Array.isArray(hitTestResult?.results) ? hitTestResult.results : []
-        const matchingResult = results.find((result: any) =>
+        let matchingResult: any = null
+
+        for (const result of results)
         {
           const resultLayer = result?.graphic?.layer
-          const resultAttributes = result?.graphic?.attributes || {}
-          const resultGardenUid = firstValue(resultAttributes, ['garden_uid', 'GARDEN_UID'])
+          const resultGardenUid = await resolveGardenUidFromHitResult(result)
+          const isHistoricalMode = displayModeRef.current === 'historical'
 
-          return (
+          if (
             resultGardenUid !== '' &&
             (
-              resultLayer === targetLayer ||
-              isConfiguredBedLayerMatch(resultLayer) ||
-              isConfiguredBedLayerMatch(result?.graphic) ||
-              String(resultLayer?.url || '').toLowerCase() === String(targetLayer?.url || '').toLowerCase() ||
-              String(resultLayer?.title || '').toLowerCase() === String(targetLayer?.title || '').toLowerCase()
+              (
+                isHistoricalMode &&
+                visibleGardenUidsRef.current.has(resultGardenUid)
+              ) ||
+              (
+                !isHistoricalMode &&
+                targetLayer &&
+                (
+                  resultLayer === targetLayer ||
+                  isConfiguredBedLayerMatch(resultLayer) ||
+                  isConfiguredBedLayerMatch(result?.graphic) ||
+                  String(resultLayer?.url || '').toLowerCase() === String(targetLayer?.url || '').toLowerCase() ||
+                  String(resultLayer?.title || '').toLowerCase() === String(targetLayer?.title || '').toLowerCase()
+                )
+              )
             )
           )
-        })
+          {
+            matchingResult = {
+              result,
+              gardenUid: resultGardenUid
+            }
+            break
+          }
+        }
 
-        const attributes = matchingResult?.graphic?.attributes || {}
-        const gardenUid = firstValue(attributes, ['garden_uid', 'GARDEN_UID'])
+        const gardenUid = matchingResult?.gardenUid || ''
 
         if (gardenUid !== '')
         {
@@ -1633,7 +1777,7 @@ const Widget = (props: AllWidgetProps<any>) =>
         {
           setBedDs(dataSource)
           syncSelectedSpeciesUidFromSession()
-          if (displayMode === 'current')
+          if (displayModeRef.current === 'current')
           {
             rebuildZoneGroupsFromDataSource(dataSource)
             syncSelectedBedFromDataSource(dataSource)
@@ -1642,7 +1786,7 @@ const Widget = (props: AllWidgetProps<any>) =>
         onDataSourceInfoChange={() =>
         {
           syncSelectedSpeciesUidFromSession()
-          if (displayMode === 'current' && bedDs)
+          if (displayModeRef.current === 'current' && bedDs)
           {
             rebuildZoneGroupsFromDataSource(bedDs)
             syncSelectedBedFromDataSource(bedDs)
@@ -1650,7 +1794,7 @@ const Widget = (props: AllWidgetProps<any>) =>
         }}
         onSelectionChange={() =>
         {
-          if (displayMode === 'current' && bedDs)
+          if (displayModeRef.current === 'current' && bedDs)
           {
             syncSelectedBedFromDataSource(bedDs)
           }
