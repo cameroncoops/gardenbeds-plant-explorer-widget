@@ -11,3 +11,15 @@ export interface SpeciesOption {
   speciesUid: string
   speciesName: string
 }
+
+export interface DataLoadSuccess<T> {
+  ok: true
+  data: T
+}
+
+export interface DataLoadFailure {
+  ok: false
+  errorMessage: string
+}
+
+export type DataLoadResult<T> = DataLoadSuccess<T> | DataLoadFailure
